@@ -1,0 +1,31 @@
+experiment_name: dscnn_vad_tiny_ava_eval
+manifest: manifests/ava_speech_paper_manifest.jsonl
+algorithm: dscnn_vad_tiny
+checkpoint: runs/dscnn_vad_tiny_ava/checkpoints/best.pt
+run_dir: runs/dscnn_vad_tiny_ava_eval
+
+features:
+  sample_rate: 16000
+  frame_ms: 25.0
+  hop_ms: 10.0
+  n_mels: 64
+  n_mfcc: 64
+  feature_type: logmel
+
+eval:
+  split: test
+  tune_split: val
+  tune_threshold: true
+  paper_metrics: true
+  target_fpr: 0.315
+  sliding_window_sec: 0.63
+  sliding_overlap: 0.0
+  median_smoothing_ms: 0.0
+
+training:
+  device: auto
+
+postprocess:
+  threshold: auto
+  min_speech_ms: 80.0
+  min_silence_ms: 160.0

@@ -1,0 +1,18 @@
+[project]
+name = "vadbench"
+version = "0.1.0"
+description = "Audio-only research benchmark for lightweight voice activity detection algorithms."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "scipy",
+  "scikit-learn",
+  "soundfile",
+  "torch",
+  "torchaudio",
+  "PyYAML",
+]
+
+[tool.setuptools.packages.find]
+include = ["vadbench*"]
+

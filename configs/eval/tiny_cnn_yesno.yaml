@@ -1,0 +1,26 @@
+experiment_name: tiny_cnn_yesno_eval
+manifest: data/yesno_synth/manifest.jsonl
+algorithm: tiny_mel_cnn
+checkpoint: runs/tiny_cnn_yesno/checkpoints/best.pt
+run_dir: runs/tiny_cnn_yesno_eval
+
+features:
+  sample_rate: 16000
+  frame_ms: 25.0
+  hop_ms: 10.0
+  n_mels: 64
+  n_mfcc: 64
+
+eval:
+  split: test
+  tune_split: val
+  tune_threshold: true
+
+training:
+  device: auto
+
+postprocess:
+  threshold: auto
+  min_speech_ms: 60.0
+  min_silence_ms: 100.0
+

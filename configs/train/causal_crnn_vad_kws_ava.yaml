@@ -1,0 +1,41 @@
+experiment_name: causal_crnn_vad_kws_ava
+manifest: manifests/ava_speech_paper_manifest.jsonl
+algorithm: causal_crnn_vad_kws
+run_dir: runs/causal_crnn_vad_kws_ava
+seed: 7
+
+features:
+  sample_rate: 16000
+  frame_ms: 25.0
+  hop_ms: 10.0
+  n_mels: 64
+  n_mfcc: 64
+  feature_type: logmel
+
+training:
+  epochs: 80
+  batch_size: 12
+  lr: 0.001
+  min_lr: 0.00001
+  weight_decay: 0.00001
+  optimizer: adamw
+  scheduler: cosine
+  class_balanced_sampling: true
+  pos_weight: auto
+  early_stop_patience: 15
+  device: auto
+  num_workers: 2
+  augment:
+    segment_frames: 100
+    gain_db: 4.0
+    time_shift_frames: 8
+    noise_std: 0.02
+    freq_masks: 2
+    time_masks: 2
+    max_freq_mask: 8
+    max_time_mask: 20
+
+postprocess:
+  threshold: 0.5
+  min_speech_ms: 80.0
+  min_silence_ms: 160.0

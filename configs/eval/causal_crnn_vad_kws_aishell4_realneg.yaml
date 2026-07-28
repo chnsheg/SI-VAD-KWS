@@ -1,0 +1,33 @@
+experiment_name: causal_crnn_vad_kws_aishell4_realneg_eval
+manifest: data/aishell4_realneg_vad/manifest.jsonl
+algorithm: causal_crnn_vad_kws
+checkpoint: runs/causal_crnn_vad_kws_aishell4_realneg/checkpoints/best.pt
+run_dir: runs/causal_crnn_vad_kws_aishell4_realneg_eval
+
+features:
+  sample_rate: 16000
+  frame_ms: 25.0
+  hop_ms: 10.0
+  n_mels: 64
+  n_mfcc: 64
+  feature_type: logmel
+
+eval:
+  split: test
+  tune_split: val
+  tune_threshold: true
+  paper_metrics: true
+  target_fpr: 0.315
+  sliding_window_sec: 1.0
+  sliding_overlap: 0.0
+  median_smoothing_ms: 0.0
+
+training:
+  device: auto
+  augment:
+    segment_frames: 100
+
+postprocess:
+  threshold: auto
+  min_speech_ms: 80.0
+  min_silence_ms: 160.0

@@ -1,0 +1,26 @@
+experiment_name: attn_tcn_lite_ava
+manifest: manifests/ava_speech_manifest.jsonl
+algorithm: attn_tcn_lite
+run_dir: runs/attn_tcn_lite_ava
+seed: 7
+
+features:
+  sample_rate: 16000
+  frame_ms: 25.0
+  hop_ms: 10.0
+  n_mels: 64
+  n_mfcc: 64
+
+training:
+  epochs: 10
+  batch_size: 8
+  lr: 0.001
+  weight_decay: 0.00001
+  device: auto
+  num_workers: 2
+
+postprocess:
+  threshold: 0.5
+  min_speech_ms: 80.0
+  min_silence_ms: 160.0
+

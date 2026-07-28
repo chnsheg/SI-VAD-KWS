@@ -1,0 +1,22 @@
+experiment_name: spectral_gate_yesno
+manifest: data/yesno_synth/manifest.jsonl
+algorithm: spectral_gate
+run_dir: runs/spectral_gate_yesno
+
+features:
+  sample_rate: 16000
+  frame_ms: 25.0
+  hop_ms: 10.0
+  n_mels: 64
+  n_mfcc: 64
+
+eval:
+  split: test
+  tune_split: val
+  tune_threshold: true
+
+postprocess:
+  threshold: auto
+  min_speech_ms: 60.0
+  min_silence_ms: 100.0
+

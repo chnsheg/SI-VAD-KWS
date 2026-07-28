@@ -1,0 +1,24 @@
+experiment_name: kaldi_energy_ava_paper_v2
+manifest: manifests/ava_speech_paper_manifest.jsonl
+algorithm: kaldi_energy
+run_dir: runs/kaldi_energy_ava_paper_v2
+
+features:
+  sample_rate: 16000
+  frame_ms: 25.0
+  hop_ms: 10.0
+  n_mels: 64
+  n_mfcc: 64
+
+eval:
+  split: test
+  tune_split: val
+  tune_threshold: true
+  paper_metrics: true
+  target_fpr: 0.315
+  median_smoothing_ms: 250.0
+
+postprocess:
+  threshold: auto
+  min_speech_ms: 80.0
+  min_silence_ms: 160.0

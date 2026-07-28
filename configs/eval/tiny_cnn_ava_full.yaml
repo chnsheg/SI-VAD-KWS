@@ -1,0 +1,25 @@
+experiment_name: tiny_cnn_ava_full_eval
+manifest: manifests/ava_speech_full_manifest.jsonl
+algorithm: tiny_mel_cnn
+checkpoint: runs/tiny_cnn_ava_full/checkpoints/best.pt
+run_dir: runs/tiny_cnn_ava_full_eval
+
+features:
+  sample_rate: 16000
+  frame_ms: 25.0
+  hop_ms: 10.0
+  n_mels: 64
+  n_mfcc: 64
+
+eval:
+  split: test
+  tune_split: val
+  tune_threshold: true
+
+training:
+  device: auto
+
+postprocess:
+  threshold: auto
+  min_speech_ms: 80.0
+  min_silence_ms: 160.0

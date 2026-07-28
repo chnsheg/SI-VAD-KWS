@@ -1,0 +1,29 @@
+experiment_name: crnn_vad_ava_paper_v2_eval
+manifest: manifests/ava_speech_paper_manifest.jsonl
+algorithm: crnn_vad
+checkpoint: runs/crnn_vad_ava_paper_v2/checkpoints/best.pt
+run_dir: runs/crnn_vad_ava_paper_v2_eval
+
+features:
+  sample_rate: 16000
+  frame_ms: 25.0
+  hop_ms: 10.0
+  n_mels: 64
+  n_mfcc: 64
+  feature_type: logmel
+
+eval:
+  split: test
+  tune_split: val
+  tune_threshold: true
+  paper_metrics: true
+  target_fpr: 0.315
+  median_smoothing_ms: 250.0
+
+training:
+  device: auto
+
+postprocess:
+  threshold: auto
+  min_speech_ms: 80.0
+  min_silence_ms: 160.0

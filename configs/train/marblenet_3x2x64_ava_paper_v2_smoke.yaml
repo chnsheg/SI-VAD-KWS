@@ -1,0 +1,33 @@
+experiment_name: marblenet_3x2x64_ava_paper_v2_smoke
+manifest: manifests/ava_paper_v2_smoke_manifest.jsonl
+algorithm: marblenet_3x2x64
+run_dir: runs/marblenet_3x2x64_ava_paper_v2_smoke
+seed: 7
+
+features:
+  sample_rate: 16000
+  frame_ms: 25.0
+  hop_ms: 10.0
+  n_mels: 64
+  n_mfcc: 64
+  feature_type: mfcc
+
+training:
+  epochs: 1
+  batch_size: 2
+  lr: 0.001
+  weight_decay: 0.00001
+  optimizer: adamw
+  class_balanced_sampling: true
+  pos_weight: auto
+  device: auto
+  num_workers: 0
+  augment:
+    segment_frames: 63
+    time_shift_frames: 2
+    noise_std: 0.01
+
+postprocess:
+  threshold: 0.5
+  min_speech_ms: 80.0
+  min_silence_ms: 160.0
