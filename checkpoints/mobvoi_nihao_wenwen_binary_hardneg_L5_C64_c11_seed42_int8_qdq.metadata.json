@@ -1,0 +1,60 @@
+{
+    "schema_version":  1,
+    "artifact":  {
+                     "file":  "mobvoi_nihao_wenwen_binary_hardneg_L5_C64_c11_seed42_int8_qdq.onnx",
+                     "sha256":  "627cd3495964749b29ce0a0af65dd98495f38051d02b0ae9861e6b3a0ca50d7c",
+                     "format":  "ONNX opset 17 QDQ"
+                 },
+    "model":  {
+                  "family":  "DSCNN KWS",
+                  "keyword":  "nihao_wenwen",
+                  "classes":  {
+                                  "0":  "positive",
+                                  "1":  "negative"
+                              },
+                  "architecture":  "L5_C64, 22530 parameters, 2 classes",
+                  "selection":  "v6.1 c11_stage_margin_scale_u16, seed_42"
+              },
+    "contract":  {
+                     "input":  {
+                                   "name":  "waveform",
+                                   "dtype":  "float32",
+                                   "shape":  [
+                                                 1,
+                                                 16000
+                                             ],
+                                   "sample_rate_hz":  16000,
+                                   "audio":  "mono, exactly one second, normalized PCM waveform"
+                               },
+                     "output":  {
+                                    "name":  "logits",
+                                    "dtype":  "float32",
+                                    "shape":  [
+                                                  1,
+                                                  2
+                                              ],
+                                    "meaning":  "unnormalized logits",
+                                    "postprocessing":  "apply softmax; positive class is index 0"
+                                },
+                     "frontend":  "strict-integer MFCC from the paired v6.1 specification; 40 MFCC coefficients, first 10 used by the backbone"
+                 },
+    "provenance":  {
+                       "upstream_commit":  "2e566c58847dfe1c546b08354e235205fad1b18b",
+                       "source_checkpoint_relative_path":  "dscnn_kws/quantization/bit_accurate_mfcc_experiments_v6_1_strict_scale_calibration/qat_runs/phase_a/c11_stage_margin_scale_u16/seed_42/mobvoi_nihao_wenwen_binary_hardneg_L5_C64_layers5_channels64_params22530_noise_best_bit_accurate_mfcc_int8_backbone.pt",
+                       "source_checkpoint_sha256":  "81c40f4e9311a4c3e5e1abcb04f6ed614978e43ff277caa7818cbdb3a9d59491",
+                       "source_spec_sha256":  "d795d4d0b7476abad5bc588ece3753887a93775074681203808d2e99208edf5e",
+                       "source_spec_relative_path":  "dscnn_kws/quantization/bit_accurate_mfcc_experiments_v6_1_strict_scale_calibration/qat_runs/phase_a/c11_stage_margin_scale_u16/seed_42/mobvoi_nihao_wenwen_binary_hardneg_L5_C64_layers5_channels64_params22530_noise_best_bit_accurate_mfcc_spec.json"
+                   },
+    "verification":  {
+                         "onnx_checker":  "passed",
+                         "provider":  "ONNX Runtime CPUExecutionProvider",
+                         "deterministic_windows":  3,
+                         "argmax_matches":  3,
+                         "max_abs_error":  0.17560964822769165,
+                         "output_quantization_step":  0.17560964822769165,
+                         "qdq_nodes":  64,
+                         "if_nodes":  0,
+                         "scope":  "demonstration validation",
+                         "limitation":  "PyTorch FBGEMM and ONNX Runtime QDQ can differ by one output quantization step because of requantization rounding. A 19-window synthetic stress probe of the hi_xiaowen model found one near-tie whose default argmax changed; do not treat this artifact as bit-exact or as unconditional production validation."
+                     }
+}
