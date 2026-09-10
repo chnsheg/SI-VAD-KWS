@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "artifact": {
+    "file": "mobvoi_nihao_wenwen_v2_final_L5_C64_v6_1_fp32.pt",
+    "sha256": "c5522566a9b4bfdcd5767a29420f106865d56796a730aa32624cc7b8a284fb29",
+    "format": "PyTorch state_dict container",
+    "precision": "FP32"
+  },
+  "model": {
+    "family": "DSCNN KWS",
+    "keyword": "nihao_wenwen",
+    "version": "v2_final_s160_locality_20260830",
+    "architecture": "L5_C64 global pooling, 22530 parameters, 2 classes",
+    "best_checkpoint_epoch": 30,
+    "validation_macro_f1": 0.9815216722709373,
+    "validation_negative_recall": 0.9834239130434783
+  },
+  "compatibility": {
+    "target": "v6.1 FP32 PyTorch export contract",
+    "top_level_keys": ["state_dict"],
+    "state_entries": 59,
+    "temporal_head": false,
+    "strict_backbone_load": "passed",
+    "input_features": 320,
+    "output_shape": [1, 2]
+  },
+  "provenance": {
+    "source_checkpoint": "kws_reclean_v2/v2_final_s160_locality_20260830/best.pt",
+    "source_checkpoint_sha256": "c72ae7c93f57a97d94a9892b8b11d615f746772a9ff18aeaa42ac8a783295401",
+    "conversion": "model weights copied unchanged into the v6.1 state_dict container"
+  }
+}
