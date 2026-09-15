@@ -21,6 +21,7 @@ checkpoints/*
 !checkpoints/*.onnx
 !checkpoints/*.metadata.json
 !checkpoints/*_v6_1_fp32.pt
+!checkpoints/*_reclean_v2_fp32.pt
 
 # Local IDE and agent/process material.
 .vscode/

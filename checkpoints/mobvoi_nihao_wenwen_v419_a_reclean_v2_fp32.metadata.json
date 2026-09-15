@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "artifact": {
+    "file": "mobvoi_nihao_wenwen_v419_a_reclean_v2_fp32.pt",
+    "sha256": "143b7fe27e3307ad03814518ae53176e0b4be389db327184dd178d4a50625c11",
+    "format": "PyTorch state_dict container ({'model': ...})",
+    "precision": "FP32"
+  },
+  "model": {
+    "family": "DSCNN KWS",
+    "keyword": "nihao_wenwen",
+    "version": "v419_a_20260915",
+    "architecture": "L5_C64 global pooling, 22530 parameters, 2 classes",
+    "best_checkpoint_epoch": 1,
+    "validation_macro_f1": 0.9730936219653887,
+    "validation_positive_recall": 0.9855978260869566,
+    "validation_negative_recall": 0.9605978260869565
+  },
+  "compatibility": {
+    "target": "reclean-v2 FP32 training/export contract (TorchMFCC triangular frontend)",
+    "frontend": "TorchMFCC float: pre_emphasis 0.97, 32 ms window/stride, 40 triangular mel bands [20, 8000] Hz, log, ortho DCT, 13 coefficients x 32 frames",
+    "top_level_keys": ["model"],
+    "state_entries": 56,
+    "all_entries_backbone_prefixed": true,
+    "input_features": 416,
+    "output_shape": [1, 2],
+    "export_toolchain": "dscnn_kws/deploy_transfer/export_float_onnx.py"
+  },
+  "training": {
+    "lineage": "reclean v2 CE line: i30(v410v2) init -> v419_a clean-start fix (3 epochs, lr 1e-5, AdamW, cosine)",
+    "dataset": "kws_reclean_aug_v1 (offline augmented) + packed mixture: raw anchors, hard_negative_v419 pack, pos_fullspec_v7 low-SNR positives",
+    "loss": "cross-entropy, strict 1:1 positive-negative balance",
+    "trainer_snapshot": "/home/chensheng/vad_kws_sources/reclean_v3/kws_trainer_20260910_v21bucket (synced to this repo)",
+    "excluded_from_training": "cs/zh/yd real-recording speakers (anti per-person fitting); blind real recordings"
+  },
+  "measured_deployment": {
+    "protocol": "1 s window, 96 ms hop, double-window confirmation, softmax positive score, no debounce",
+    "threshold": 0.5,
+    "recapture_recall": {
+      "cs": 0.994,
+      "zh": 0.910,
+      "yd_note": "yd uses a first-tone 'hi' variant of the keyword; not waking is correct and is excluded from targets"
+    },
+    "real_scene_fah_per_hour": 1982,
+    "status": "current delivery candidate of the reclean-v2 line; false-wake suppression to near-zero FAH still in progress (see handover notes in README)"
+  },
+  "provenance": {
+    "source_checkpoint": "ai.si-in.com:/home/chensheng/kws_training_runs/kws_reclean_v2/v419_a_20260915/best.pt",
+    "source_checkpoint_sha256": "6728e5b535598d9869497ee0ccb1d1127e92ffcedb1fe30a07096c762045d7e1",
+    "conversion": "model weights copied unchanged; optimizer, scheduler, history, and provenance stripped"
+  }
+}

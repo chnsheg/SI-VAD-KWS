@@ -6,11 +6,18 @@ Full-precision PyTorch checkpoints:
 
 - `mobvoi_nihao_wenwen_v2_final_L5_C64_v6_1_fp32.pt`
 - `mobvoi_nihao_wenwen_v3_final_L5_C64_v6_1_fp32.pt`
+- `mobvoi_nihao_wenwen_v419_a_reclean_v2_fp32.pt` (current reclean-v2 delivery candidate)
 
-Both FP32 files use the v6.1 `{"state_dict": ...}` container contract. Their L5/C64
+The first two FP32 files use the v6.1 `{"state_dict": ...}` container contract. Their L5/C64
 global-pooling backbones load strictly into the v6.1 32-frame, 10-coefficient model without
 key conversion. They contain model state only; optimizer, scheduler, training history, and
 temporary experiment state are excluded.
+
+`mobvoi_nihao_wenwen_v419_a_reclean_v2_fp32.pt` is the current delivery candidate of the
+reclean-v2 CE line. It uses the `{"model": ...}` container with 56 `backbone.*` entries,
+the TorchMFCC triangular frontend (13 coefficients x 32 frames), and is exported through
+`dscnn_kws/deploy_transfer/export_float_onnx.py`. Its measured deployment status, training
+lineage, and known limitations are recorded in its `.metadata.json`.
 
 Quantized ONNX deployment artifacts:
 
