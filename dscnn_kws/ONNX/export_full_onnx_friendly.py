@@ -112,8 +112,6 @@ def build_model(
         label_count=label_count,
         model_size_info=make_model_size_info(num_layers, channels),
         dct_coeff=args.dct_coeff,
-        pooling=getattr(args, "pooling", "global"),
-        temporal_bins=int(getattr(args, "temporal_bins", 4)),
     )
     backbone.load_state_dict(extract_backbone_state(state), strict=True)
 
@@ -239,8 +237,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", default=str(Path(__file__).resolve().parent / "models_full"))
     parser.add_argument("--opset", type=int, default=17)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--pooling", choices=["global", "temporal"], default="global")
-    parser.add_argument("--temporal_bins", type=int, default=4)
     parser.add_argument("--dynamic_batch", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--check_onnx", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--check_onnxruntime", action="store_true", default=False)

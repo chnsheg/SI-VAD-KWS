@@ -16,11 +16,12 @@ from .packed_pcm import PackedPcmDataset
 
 
 ROLE_QUOTAS_PER_TWENTY = {
-    "base_positive": 7,
-    "raw_positive": 3,
-    "base_negative": 5,
-    "raw_negative": 3,
-    "hard_negative": 2,
+    "base_positive": 4,
+    "raw_positive": 2,
+    "low_snr_positive": 4,
+    "base_negative": 3,
+    "raw_negative": 1,
+    "hard_negative": 6,
 }
 
 V3_ROLE_QUOTAS_PER_TWENTY = {
@@ -32,51 +33,11 @@ V3_ROLE_QUOTAS_PER_TWENTY = {
     "captured_environment_negative": 2,
     "tau_environment_negative": 1,
 }
-V3_PHONETIC_HARD_NEGATIVE_ROLE = "phonetic_hard_negative"
-V3_STRUCTURED_ACOUSTIC_NEGATIVE_ROLE = "structured_acoustic_negative"
-V3_OPTIONAL_ROLE_NAMES = (
-    V3_PHONETIC_HARD_NEGATIVE_ROLE,
-    V3_STRUCTURED_ACOUSTIC_NEGATIVE_ROLE,
-)
-V3_EXTENDED_ROLE_NAMES = (*V3_ROLE_QUOTAS_PER_TWENTY, *V3_OPTIONAL_ROLE_NAMES)
 
 _V3_POSITIVE_ROLES = frozenset({"base_positive", "raw_positive"})
 _V3_MIXED_LABEL_REUSE_ROLES = frozenset({"raw_positive", "raw_negative"})
 
 LOCALITY_STEPS_PER_BLOCK = 4
-
-
-def parse_v3_role_quotas(entries: Collection[str] | None) -> dict[str, int]:
-    """Parse a complete, class-balanced v3 role quota override."""
-    if not entries:
-        return dict(V3_ROLE_QUOTAS_PER_TWENTY)
-    parsed: dict[str, int] = {}
-    for entry in entries:
-        name, separator, raw_value = str(entry).partition("=")
-        if not separator or not name or not raw_value or name in parsed:
-            raise ValueError("V3 role quotas must be unique name=count pairs")
-        try:
-            value = int(raw_value)
-        except ValueError as error:
-            raise ValueError(f"V3 role quota must be an integer: {entry}") from error
-        parsed[name] = value
-    supported = set(V3_EXTENDED_ROLE_NAMES)
-    required = set(V3_ROLE_QUOTAS_PER_TWENTY)
-    required.update(name for name in V3_OPTIONAL_ROLE_NAMES if name in parsed)
-    unknown = set(parsed).difference(supported)
-    if unknown:
-        raise ValueError(f"V3 role quota contains unknown roles: {', '.join(sorted(unknown))}")
-    missing = required.difference(parsed)
-    if missing:
-        raise ValueError(f"V3 role quota is missing roles: {', '.join(sorted(missing))}")
-    if any(value < 1 for value in parsed.values()):
-        raise ValueError("V3 role quotas must be positive")
-    if sum(parsed.values()) != 20:
-        raise ValueError("V3 role quotas must sum to twenty")
-    positive_slots = sum(parsed[name] for name in _V3_POSITIVE_ROLES)
-    if positive_slots != 10:
-        raise ValueError("V3 role quotas must be class balanced with ten positive slots")
-    return {name: parsed[name] for name in V3_EXTENDED_ROLE_NAMES if name in required}
 
 
 @dataclass(frozen=True)
@@ -107,17 +68,25 @@ class CompositePackedDataset(Dataset):
         base_manifest: Path | str,
         raw_anchor_manifest: Path | str,
         hard_negative_manifest: Path | str,
+        low_snr_positive_manifest: Path | str | None = None,
     ) -> "CompositePackedDataset":
         base = PackedPcmDataset(base_manifest)
         raw = PackedPcmDataset(raw_anchor_manifest)
         hard = PackedPcmDataset(hard_negative_manifest)
+        lsnr = PackedPcmDataset(low_snr_positive_manifest) if low_snr_positive_manifest else None
         roles = [
             PackedRole("base_positive", base, 0, base.label_indices(0)),
             PackedRole("raw_positive", raw, 0, raw.label_indices(0)),
+        ]
+        if lsnr is not None:
+            if lsnr.label_indices(1):
+                raise ValueError("Low-SNR positive pack must contain positive labels only")
+            roles.append(PackedRole("low_snr_positive", lsnr, 0, lsnr.label_indices(0)))
+        roles.extend([
             PackedRole("base_negative", base, 1, base.label_indices(1)),
             PackedRole("raw_negative", raw, 1, raw.label_indices(1)),
             PackedRole("hard_negative", hard, 1, hard.label_indices(1)),
-        ]
+        ])
         if any(not role.indexes for role in roles):
             missing = [role.name for role in roles if not role.indexes]
             raise ValueError(f"Composite pack has an empty role: {', '.join(missing)}")
@@ -126,19 +95,11 @@ class CompositePackedDataset(Dataset):
         return cls(roles)
 
     @classmethod
-    def from_v3_manifests(
-        cls,
-        manifests: Mapping[str, Path | str],
-        *,
-        quotas: Mapping[str, int] | None = None,
-    ) -> "CompositePackedDataset":
-        resolved_quotas = parse_v3_role_quotas(
-            None if quotas is None else [f"{name}={value}" for name, value in quotas.items()]
-        )
-        if set(manifests) != set(resolved_quotas):
+    def from_v3_manifests(cls, manifests: Mapping[str, Path | str]) -> "CompositePackedDataset":
+        if set(manifests) != set(V3_ROLE_QUOTAS_PER_TWENTY):
             raise ValueError("V3 manifests must name exactly the V3 mixture roles")
         roles: list[PackedRole] = []
-        for name in resolved_quotas:
+        for name in V3_ROLE_QUOTAS_PER_TWENTY:
             expected_label = 0 if name in _V3_POSITIVE_ROLES else 1
             dataset, indexes = cls._load_v3_role_source(name, manifests[name], expected_label)
             if not indexes:
@@ -147,7 +108,7 @@ class CompositePackedDataset(Dataset):
             if name not in _V3_MIXED_LABEL_REUSE_ROLES and dataset.label_indices(other_label):
                 raise ValueError(f"V3 packed role must contain only label {expected_label}: {name}")
             roles.append(PackedRole(name, dataset, expected_label, indexes))
-        return cls(roles, quotas=resolved_quotas)
+        return cls(roles, quotas=V3_ROLE_QUOTAS_PER_TWENTY)
 
     @staticmethod
     def _load_v3_role_source(
@@ -161,8 +122,6 @@ class CompositePackedDataset(Dataset):
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError(f"Unable to read V3 role source for {name}: {path}") from error
         if isinstance(payload, dict) and payload.get("format") == "packed_pcm16_v1":
-            if payload.get("intended_use") == "evaluation_only":
-                raise ValueError(f"V3 role {name} is evaluation-only and cannot enter a training mixture")
             dataset = PackedPcmDataset(path)
             return dataset, dataset.label_indices(expected_label)
         if name != "raw_positive":
@@ -178,9 +137,7 @@ class CompositePackedDataset(Dataset):
             raise ValueError("raw_positive reference has no external manifest")
         dataset = PackedPcmDataset(Path(external_manifest).expanduser().resolve())
         excluded = payload.get("excluded_record_indices", [])
-        if not isinstance(excluded, list) or any(
-            isinstance(index, bool) or not isinstance(index, int) for index in excluded
-        ):
+        if not isinstance(excluded, list) or any(isinstance(index, bool) or not isinstance(index, int) for index in excluded):
             raise ValueError("raw_positive reference exclusions must be integer indexes")
         if len(set(excluded)) != len(excluded) or any(not 0 <= index < len(dataset) for index in excluded):
             raise ValueError("raw_positive reference exclusions are invalid")
@@ -199,7 +156,8 @@ class CompositePackedDataset(Dataset):
         waveform, label = role.dataset[int(record_index)]
         if label != role.label:
             raise ValueError(f"Packed role {role.name} returned label {label}")
-        return waveform, label, role.dataset.jitter_ms_at(int(record_index)), role.name
+        domain = role.dataset.domain_at(int(record_index)) if hasattr(role.dataset, "domain_at") else 12
+        return waveform, label, role.dataset.jitter_ms_at(int(record_index)), role.name, domain
 
     def close(self) -> None:
         for dataset in self._datasets:

@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 
 from dscnn_kws.configs import CLASS_ENCODING, CLASS_LIST, DEFAULT_MODEL_SIZE_INFO
 from dscnn_kws.data.dataset import SpeechCommandDataset
-from dscnn_kws.model import CepstralTCN, DSCNN
+from dscnn_kws.model import DSCNN
 from dscnn_kws.model.dscnn import calculate_time_steps
 from dscnn_kws.train import MFCCDSCNN
 
@@ -69,31 +69,15 @@ def build_eval_loader(data_path, split, args, manifest_path=None):
 
 def build_model(args, device):
     time_steps = calculate_time_steps(args.sample_rate, args.window_stride_ms)
-    input_dim = time_steps * args.dct_coeff
+    _feat_ch = args.dct_coeff * (2 if getattr(args, "frontend_delta", False) else 1)
+    input_dim = time_steps * _feat_ch
 
-    architecture = getattr(args, "model", "dscnn")
-    if architecture == "dscnn":
-        backbone = DSCNN(
-            input_dim=input_dim,
-            label_count=len(CLASS_LIST),
-            model_size_info=args.model_size_info,
-            dct_coeff=args.dct_coeff,
-            pooling=getattr(args, "pooling", "global"),
-            temporal_bins=int(getattr(args, "temporal_bins", 4)),
-        )
-    elif architecture == "cepstral_tcn":
-        backbone = CepstralTCN(
-            input_dim=input_dim,
-            label_count=len(CLASS_LIST),
-            dct_coeff=args.dct_coeff,
-            channels=int(getattr(args, "tcn_channels", 68)),
-            num_blocks=int(getattr(args, "tcn_blocks", 4)),
-            kernel_size=int(getattr(args, "tcn_kernel_size", 3)),
-            dilations=getattr(args, "tcn_dilations", [1, 1, 2, 2]),
-            temporal_bins=int(getattr(args, "tcn_temporal_bins", 8)),
-        )
-    else:
-        raise ValueError(f"Unsupported evaluation model: {architecture}")
+    backbone = DSCNN(
+        input_dim=input_dim,
+        label_count=len(CLASS_LIST),
+        model_size_info=args.model_size_info,
+        dct_coeff=_feat_ch,
+    )
 
     model = MFCCDSCNN(
         backbone=backbone,
@@ -116,8 +100,6 @@ def build_model(args, device):
         spec_aug_num_freq_masks=0,
         spec_aug_num_time_masks=0,
         mfcc_impl=args.mfcc_impl,
-        mfcc_scale=getattr(args, "mfcc_scale", "torchaudio_db"),
-        mfcc_c0_cmn=bool(getattr(args, "mfcc_c0_cmn", False)),
         mel_filter_shape=args.mel_filter_shape,
         log_approx_mode=args.log_approx_mode,
         log_pwl_num_segments=args.log_pwl_num_segments,
@@ -128,9 +110,22 @@ def build_model(args, device):
         log_pwl_intercepts=None,
         log_offset=args.log_offset,
         log_input_clamp_min=args.log_input_clamp_min,
+        frontend_delta=getattr(args, "frontend_delta", False),
+        pcen_t=getattr(args, "pcen_t", None),
+        pcen_gain=getattr(args, "pcen_gain", 1.0),
+        pcen_power=getattr(args, "pcen_power", 0.5),
+        pcen_eps=getattr(args, "pcen_eps", 1e-6),
+        pcen_stats_file=getattr(args, "pcen_stats", None),
+        pcen_blend_w=getattr(args, "pcen_blend_w", 0.0),
+        pcmn_alpha=args.pcmn_alpha,
+        pcmn_delta=args.pcmn_delta,
+        pcmn_num_drop=args.pcmn_num_drop,
+        pcmn_blend_w=args.pcmn_blend_w,
     ).to(device)
 
-    model.load_state_dict(load_state_dict(args.ckpt, device))
+    _state = load_state_dict(args.ckpt, device)
+    _state = {k: v for k, v in _state.items() if not k.startswith("domain_head.")}
+    model.load_state_dict(_state)
     model.eval()
     return model
 
@@ -229,15 +224,7 @@ def main():
     parser.add_argument("--dct_coeff", default=13, type=int)
     parser.add_argument("--window_size_ms", default=32, type=int)
     parser.add_argument("--window_stride_ms", default=32, type=int)
-    parser.add_argument("--model", choices=["dscnn", "cepstral_tcn"], default="dscnn")
     parser.add_argument("--model_size_info", nargs="+", type=int, default=DEFAULT_MODEL_SIZE_INFO)
-    parser.add_argument("--pooling", choices=["global", "temporal"], default="global")
-    parser.add_argument("--temporal_bins", default=4, type=int)
-    parser.add_argument("--tcn_channels", default=68, type=int)
-    parser.add_argument("--tcn_blocks", default=4, type=int)
-    parser.add_argument("--tcn_kernel_size", default=3, type=int)
-    parser.add_argument("--tcn_dilations", nargs="+", default=[1, 1, 2, 2], type=int)
-    parser.add_argument("--tcn_temporal_bins", default=8, type=int)
 
     parser.add_argument("--bandpass_n_bands", default=16, type=int)
     parser.add_argument("--bandpass_f_min", default=200.0, type=float)
@@ -250,8 +237,6 @@ def main():
     parser.add_argument("--pre_emphasis_coeff", default=0.97, type=float)
 
     parser.add_argument("--mfcc_impl", choices=["torchaudio", "torch"], default="torchaudio")
-    parser.add_argument("--mfcc_scale", choices=["natural_log", "torchaudio_db"], default="torchaudio_db")
-    parser.add_argument("--mfcc_c0_cmn", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--mel_filter_shape", choices=["triangular", "rectangular"], default="triangular")
     parser.add_argument("--log_approx_mode", choices=["exact", "pwl"], default="exact")
     parser.add_argument("--log_pwl_num_segments", default=6, type=int)
@@ -259,6 +244,10 @@ def main():
     parser.add_argument("--log_pwl_gamma", default=1.0, type=float)
     parser.add_argument("--log_offset", default=1e-6, type=float)
     parser.add_argument("--log_input_clamp_min", default=1e-12, type=float)
+    parser.add_argument("--pcmn_alpha", default=None, type=float)
+    parser.add_argument("--pcmn_delta", default=1.0, type=float)
+    parser.add_argument("--pcmn_num_drop", default=0, type=int)
+    parser.add_argument("--pcmn_blend_w", default=0.0, type=float)
 
     args = parser.parse_args()
 

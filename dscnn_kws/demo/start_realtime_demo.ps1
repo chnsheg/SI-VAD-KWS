@@ -1,21 +1,19 @@
 [CmdletBinding(PositionalBinding=$false)]
 param(
     [string]$Device,
-    [Parameter(Mandatory=$true)]
-    [string]$VadModel,
-    [string]$KwsModel = 'checkpoints/mobvoi_nihao_wenwen_binary_hardneg_L5_C64_c11_seed42_int8_qdq.onnx',
-    [string]$Python = 'python',
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$DemoArgs
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$vadModel = (Resolve-Path $VadModel).Path
-$kwsModel = (Resolve-Path (Join-Path $repoRoot $KwsModel)).Path
+$workspaceRoot = (Resolve-Path (Join-Path $repoRoot '..')).Path
+$python = Join-Path $workspaceRoot '.envs\vadbench-py311-cpu\python.exe'
+$vadModel = Join-Path $workspaceRoot 'handover_artifacts\models\causal-crnn-vad-kws-realneg\model.onnx'
+$kwsModel = Join-Path $repoRoot 'artifacts\v6_1_hi_xiaowen_exact_int8.onnx'
 $launcher = Join-Path $repoRoot 'dscnn_kws\demo\run_demo.py'
 
-$requiredPaths = @($vadModel, $kwsModel, $launcher)
+$requiredPaths = @($python, $vadModel, $kwsModel, $launcher)
 foreach ($path in $requiredPaths) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Required demo file is missing: $path"
@@ -38,5 +36,5 @@ if ($DemoArgs) {
 }
 
 Write-Host 'Starting dashboard on http://127.0.0.1:19374/'
-& $Python $launcher @arguments
+& $python $launcher @arguments
 exit $LASTEXITCODE

@@ -161,26 +161,6 @@ def build_reference(checkpoint: Path, spec: Path) -> nn.Module:
             f"{torch.backends.quantized.supported_engines}"
         )
 
-    # v6.1's direct INT8 graph is defined for the historical global-pooling
-    # DSCNN only.  A temporal head has a different classifier shape and a
-    # different reduction (AdaptiveAvgPool2d(B, 1)); silently feeding such a
-    # checkpoint into this exporter would either fail deep in torch or, worse,
-    # produce a graph whose logits do not match the checkpoint.  Fail early
-    # with an actionable message and use export_full_onnx_friendly.py for a
-    # temporal FP32/ONNX export until a temporal INT8 lowering is implemented.
-    try:
-        payload = torch.load(_filesystem_path(checkpoint), map_location="cpu", weights_only=True)
-    except TypeError:
-        payload = torch.load(_filesystem_path(checkpoint), map_location="cpu")
-    if not isinstance(payload, dict) or "state_dict" not in payload:
-        raise TypeError(f"checkpoint does not contain a state_dict: {checkpoint}")
-    state_dict = payload["state_dict"]
-    if isinstance(state_dict, dict) and any("temporal_fc." in str(key) for key in state_dict):
-        raise ValueError(
-            "v6.1 direct INT8 exporter does not support temporal DSCNN pooling; "
-            "use export_full_onnx_friendly.py for temporal models or export a global-pooling checkpoint"
-        )
-
     previous_engine = torch.backends.quantized.engine
     torch.backends.quantized.engine = "fbgemm"
     try:
@@ -198,6 +178,9 @@ def build_reference(checkpoint: Path, spec: Path) -> nn.Module:
             quantized_backbone=converted.backbone,
             dct_coeff=args.dct_coeff,
         )
+        payload = torch.load(_filesystem_path(checkpoint), map_location="cpu", weights_only=True)
+        if not isinstance(payload, dict) or "state_dict" not in payload:
+            raise TypeError(f"checkpoint does not contain a state_dict: {checkpoint}")
         reference.load_state_dict(payload["state_dict"], strict=True)
         return reference.eval()
     finally:

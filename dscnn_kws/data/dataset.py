@@ -12,20 +12,7 @@ import torchaudio.functional as AF
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
-from .confirmation_pair import ConfirmationPairDataset, DistributedClassStratifiedPairBatchSampler
-from .online_augmentation import (
-    ONLINE_AUGMENT_PROFILE,
-    NoiseCatalog,
-    OnlineAugmentedDataset,
-    OnlineWaveformAugmenter,
-    RoleAugmentationRule,
-    StratifiedRoleBatchSampler,
-    default_nihao_wenwen_rules,
-    manifest_sample_roles,
-    parse_role_quotas,
-    parse_snr_bands,
-)
-from .packed_mixture import CompositePackedDataset, StratifiedCompositeBatchSampler, parse_v3_role_quotas
+from .packed_mixture import CompositePackedDataset, StratifiedCompositeBatchSampler
 from .packed_pcm import PackedPcmDataset
 
 
@@ -312,7 +299,7 @@ class SpeechCommandDataset(Dataset):
                     f"Noise sample-rate mismatch: {noise_path}, got {noise_sr}, expected {self.sampling_rate}"
                 )
         if noise.shape[0] > 1:
-            noise = noise[:1]
+            noise = noise.mean(dim=0, keepdim=True)
         return noise.to(torch.float32).clamp(-1.0, 1.0)
 
     def _random_state(self, index: int | None):
@@ -362,7 +349,7 @@ class SpeechCommandDataset(Dataset):
                 raise ValueError(f"Sample-rate mismatch: {speech_path}, got {orig_sr}, expected {self.sampling_rate}")
 
         if waveform.shape[0] > 1:
-            waveform = waveform[:1]
+            waveform = waveform.mean(dim=0, keepdim=True)
         waveform = waveform.to(torch.float32).clamp(-1.0, 1.0)
         is_exact_length = waveform.shape[1] == self.sample_length
 
@@ -444,22 +431,8 @@ def build_dataloaders(data_path: str, class_list, class_encoding, args):
     allow_online_resample = arg("allow_online_resample", False)
     strict_sample_rate = arg("strict_sample_rate", True)
     online_window_jitter_ms = arg("online_window_jitter_ms", None)
-    online_augment_profile = str(arg("online_augment_profile", "none") or "none")
-    online_noise_domains = list(arg("online_noise_domain", []) or [])
-    online_noise_domain_weights = list(arg("online_noise_domain_weight", []) or [])
-    online_positive_snr_bands = list(arg("online_positive_snr_band", []) or [])
-    online_negative_snr_bands = list(arg("online_negative_snr_band", []) or [])
-    online_hard_negative_snr_bands = list(arg("online_hard_negative_snr_band", []) or [])
-    online_role_quotas = list(arg("online_role_quota", []) or [])
-    online_steps_per_epoch = int(arg("online_steps_per_epoch", 0))
     num_workers = arg("num_workers", 0)
     prefetch_factor = arg("prefetch_factor", 4)
-    packed_loader_workers = int(arg("packed_loader_workers", 1))
-    packed_prefetch_factor = int(arg("packed_prefetch_factor", 1))
-    if packed_loader_workers < 1:
-        raise ValueError("packed_loader_workers must be positive")
-    if packed_prefetch_factor < 1:
-        raise ValueError("packed_prefetch_factor must be positive")
     batch = arg("batch", 256)
     gpu = arg("gpu", 0)
     packed_train_index = arg("packed_train_index", "")
@@ -473,12 +446,6 @@ def build_dataloaders(data_path: str, class_list, class_encoding, args):
         raw_v3_roles = []
     if isinstance(raw_v3_roles, str):
         raw_v3_roles = [raw_v3_roles]
-    raw_v3_quotas = arg("mixture_v3_quota", [])
-    if raw_v3_quotas is None:
-        raw_v3_quotas = []
-    if isinstance(raw_v3_quotas, str):
-        raw_v3_quotas = [raw_v3_quotas]
-    v3_quotas = parse_v3_role_quotas(raw_v3_quotas)
     raw_v3_replacement_roles = arg("mixture_v3_allow_replacement_role", [])
     if raw_v3_replacement_roles is None:
         raw_v3_replacement_roles = []
@@ -499,6 +466,7 @@ def build_dataloaders(data_path: str, class_list, class_encoding, args):
         if not separator or not name or not manifest or name in v3_manifests:
             raise ValueError("V3 mixture roles must be unique name=manifest pairs")
         v3_manifests[name] = manifest
+    mixture_low_snr_positive_pack = arg("mixture_low_snr_positive_pack", "")
     mixture_pack_paths = (
         mixture_base_pack,
         mixture_raw_anchor_pack,
@@ -507,16 +475,6 @@ def build_dataloaders(data_path: str, class_list, class_encoding, args):
     has_v2_mixture_pack = any(mixture_pack_paths)
     has_v3_mixture_pack = bool(v3_manifests)
     has_mixture_pack = has_v2_mixture_pack or has_v3_mixture_pack
-    advanced_online_augmentation = online_augment_profile != "none"
-
-    if advanced_online_augmentation and online_augment_profile != ONLINE_AUGMENT_PROFILE:
-        raise ValueError(f"Unsupported online augmentation profile: {online_augment_profile}")
-    if advanced_online_augmentation and bool(arg("offline_augmented_dataset", False)):
-        raise ValueError("Online augmentation cannot be combined with offline_augmented_dataset")
-    if advanced_online_augmentation and not online_noise_domains:
-        online_noise_domains = [f"noise_{index}={root}" for index, root in enumerate(train_noise_roots or ())]
-    if advanced_online_augmentation and not online_noise_domains:
-        raise ValueError("Online augmentation requires --online-noise-domain or --train_noise_roots")
 
     if has_v2_mixture_pack and not all(mixture_pack_paths):
         raise ValueError("v2 mixture training requires base, raw-anchor, and hard-negative packs")
@@ -529,16 +487,17 @@ def build_dataloaders(data_path: str, class_list, class_encoding, args):
     if has_mixture_pack and int(batch) % 20:
         raise ValueError("mixture batch must be divisible by 20")
     if has_mixture_pack and int(mixture_steps_per_epoch) < 1:
-        raise ValueError("v2 mixture_steps_per_epoch must be positive")
+        raise ValueError("mixture_steps_per_epoch must be positive")
 
     if has_v3_mixture_pack:
-        train_dataset = CompositePackedDataset.from_v3_manifests(v3_manifests, quotas=v3_quotas)
+        train_dataset = CompositePackedDataset.from_v3_manifests(v3_manifests)
         role_prefix = "V3"
     elif has_v2_mixture_pack:
         train_dataset = CompositePackedDataset.from_manifests(
             base_manifest=mixture_base_pack,
             raw_anchor_manifest=mixture_raw_anchor_pack,
             hard_negative_manifest=mixture_hard_negative_pack,
+            low_snr_positive_manifest=(mixture_low_snr_positive_pack or None),
         )
         role_prefix = "v2"
     else:
@@ -563,7 +522,7 @@ def build_dataloaders(data_path: str, class_list, class_encoding, args):
             class_list=class_list,
             class_encoding=class_encoding,
             sample_rate=sample_rate,
-            noise_aug=noise_aug and not advanced_online_augmentation,
+            noise_aug=noise_aug,
             noise_roots=train_noise_roots,
             noise_prob=noise_aug_prob,
             noise_snr_min_db=noise_snr_min_db,
@@ -573,40 +532,6 @@ def build_dataloaders(data_path: str, class_list, class_encoding, args):
             allow_online_resample=allow_online_resample,
             strict_sample_rate=strict_sample_rate,
             online_window_jitter_ms=online_window_jitter_ms,
-        )
-    online_sample_roles = None
-    if advanced_online_augmentation:
-        rules = default_nihao_wenwen_rules()
-        rules = {
-            "positive": RoleAugmentationRule(
-                rules["positive"].mix_probability,
-                parse_snr_bands(online_positive_snr_bands, rules["positive"].snr),
-            ),
-            "negative": RoleAugmentationRule(
-                rules["negative"].mix_probability,
-                parse_snr_bands(online_negative_snr_bands, rules["negative"].snr),
-            ),
-            "hard_negative": RoleAugmentationRule(
-                rules["hard_negative"].mix_probability,
-                parse_snr_bands(online_hard_negative_snr_bands, rules["hard_negative"].snr),
-            ),
-        }
-        catalog = NoiseCatalog.from_entries(
-            online_noise_domains,
-            weight_entries=online_noise_domain_weights,
-        )
-        augmenter = OnlineWaveformAugmenter(
-            catalog,
-            sample_rate=sample_rate,
-            rules=rules,
-            allow_resample=allow_online_resample,
-        )
-        if not packed_train_index and not has_mixture_pack:
-            online_sample_roles = manifest_sample_roles(train_manifest)
-        train_dataset = OnlineAugmentedDataset(
-            train_dataset,
-            augmenter,
-            sample_roles=online_sample_roles,
         )
     valid_dataset = SpeechCommandDataset(
         dataset_path=data_path,
@@ -648,7 +573,7 @@ def build_dataloaders(data_path: str, class_list, class_encoding, args):
         )
 
     packed_training = bool(packed_train_index or has_mixture_pack)
-    train_num_workers = packed_loader_workers if packed_training else num_workers
+    train_num_workers = 1 if packed_training else num_workers
     eval_num_workers = max(0, num_workers // 2)
 
     distributed = bool(getattr(args, "distributed", False))
@@ -692,30 +617,6 @@ def build_dataloaders(data_path: str, class_list, class_encoding, args):
             "persistent_workers": True,
             "generator": torch.Generator().manual_seed(int(seed) + rank),
         }
-    elif advanced_online_augmentation:
-        if online_sample_roles is None:
-            raise ValueError("Online role sampling requires manifest-backed training data")
-        has_hard_negatives = "hard_negative" in online_sample_roles
-        quotas = parse_role_quotas(
-            online_role_quotas,
-            batch_size=int(batch),
-            has_hard_negatives=has_hard_negatives,
-        )
-        steps_per_epoch = online_steps_per_epoch or max(1, math.ceil(len(train_dataset) / int(batch)))
-        train_loader_kwargs = {
-            "batch_sampler": StratifiedRoleBatchSampler(
-                online_sample_roles,
-                quotas=quotas,
-                rank=rank,
-                world_size=world_size,
-                seed=seed,
-                steps_per_epoch=steps_per_epoch,
-            ),
-            "num_workers": train_num_workers,
-            "pin_memory": gpu > 0 or distributed,
-            "persistent_workers": train_num_workers > 0,
-            "generator": torch.Generator().manual_seed(int(seed) + rank),
-        }
     else:
         train_loader_kwargs = {
             "batch_size": batch,
@@ -738,7 +639,7 @@ def build_dataloaders(data_path: str, class_list, class_encoding, args):
         "generator": torch.Generator().manual_seed(int(seed) + rank + 100000),
     }
     if train_num_workers > 0:
-        train_loader_kwargs["prefetch_factor"] = packed_prefetch_factor if packed_training else max(2, prefetch_factor)
+        train_loader_kwargs["prefetch_factor"] = 1 if packed_training else max(2, prefetch_factor)
         train_loader_kwargs["multiprocessing_context"] = "spawn"
     if eval_num_workers > 0:
         eval_loader_kwargs["prefetch_factor"] = max(2, prefetch_factor)
@@ -752,88 +653,3 @@ def build_dataloaders(data_path: str, class_list, class_encoding, args):
         test_loader_kwargs["sampler"] = test_sampler
         test_loader = DataLoader(test_dataset, **test_loader_kwargs)
     return train_loader, valid_loader, test_loader
-
-
-def build_confirmation_pair_loader(
-    class_encoding,
-    args,
-    *,
-    steps_per_epoch: int | None = None,
-) -> DataLoader | None:
-    """Build the optional auxiliary pair loader without changing base CE data."""
-
-    pair_objective = bool(getattr(args, "pair_objective", False))
-    manifest_path = str(getattr(args, "pair_train_manifest", "") or "")
-    if pair_objective != bool(manifest_path):
-        raise ValueError("--pair_objective and --pair_train_manifest must be enabled together")
-    if not pair_objective:
-        return None
-
-    sample_rate = int(getattr(args, "sample_rate", 8_000))
-    hop_ms = float(getattr(args, "pair_hop_ms", 96.0))
-    if not math.isfinite(hop_ms):
-        raise ValueError("pair_hop_ms must be finite")
-    hop_samples = round(float(sample_rate) * hop_ms / 1000.0)
-    if hop_samples < 1:
-        raise ValueError("pair_hop_ms must produce at least one sample")
-    dataset = ConfirmationPairDataset(
-        manifest_path,
-        class_encoding=class_encoding,
-        sample_rate=sample_rate,
-        window_samples=sample_rate,
-        hop_samples=hop_samples,
-        expected_source_split="train",
-    )
-
-    distributed = bool(getattr(args, "distributed", False))
-    rank = int(getattr(args, "rank", 0))
-    world_size = int(getattr(args, "world_size", 1))
-    seed = int(getattr(args, "seed", 42))
-    configured_pair_batch = getattr(args, "pair_batch", None)
-    pair_batch = int(configured_pair_batch) if configured_pair_batch is not None else int(getattr(args, "batch", 256))
-    if pair_batch < 1:
-        raise ValueError("pair_batch must be positive")
-    configured_positive_count = getattr(args, "pair_positive_per_batch", None)
-    positive_per_batch = (
-        int(configured_positive_count)
-        if configured_positive_count is not None
-        else 0
-    )
-    if positive_per_batch < 0:
-        raise ValueError("pair_positive_per_batch must be non-negative")
-    if float(getattr(args, "pair_tail_ranking_weight", 0.0)) > 0.0 and positive_per_batch == 0:
-        raise ValueError("pair tail ranking requires pair_positive_per_batch greater than zero")
-    configured_workers = getattr(args, "pair_num_workers", None)
-    num_workers = (
-        int(configured_workers) if configured_workers is not None else int(getattr(args, "num_workers", 0))
-    )
-    if num_workers < 0:
-        raise ValueError("pair_num_workers must be non-negative")
-    kwargs = {
-        "num_workers": num_workers,
-        "pin_memory": int(getattr(args, "gpu", 0)) > 0 or distributed,
-        "persistent_workers": num_workers > 0,
-        "generator": torch.Generator().manual_seed(seed + rank + 300_000),
-    }
-    if positive_per_batch:
-        kwargs["batch_sampler"] = DistributedClassStratifiedPairBatchSampler(
-            dataset,
-            batch_size=pair_batch,
-            positive_per_batch=positive_per_batch,
-            rank=rank,
-            world_size=world_size,
-            seed=seed + 300_000,
-            steps_per_epoch=steps_per_epoch,
-        )
-    else:
-        sampler = build_train_sampler(dataset, rank, world_size, seed + 300_000) if distributed else None
-        kwargs.update(
-            batch_size=pair_batch,
-            shuffle=sampler is None,
-            sampler=sampler,
-            drop_last=False,
-        )
-    if num_workers > 0:
-        kwargs["prefetch_factor"] = max(2, int(getattr(args, "prefetch_factor", 4)))
-        kwargs["multiprocessing_context"] = "spawn"
-    return DataLoader(dataset, **kwargs)

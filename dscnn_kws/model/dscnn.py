@@ -31,27 +31,12 @@ class DepthwiseSeparableConv2d(nn.Module):
 
 
 class DSCNN(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        label_count: int,
-        model_size_info: List[int],
-        dct_coeff: int,
-        *,
-        pooling: str = "global",
-        temporal_bins: int = 4,
-    ):
+    def __init__(self, input_dim: int, label_count: int, model_size_info: List[int], dct_coeff: int):
         super().__init__()
         self.num_layers = model_size_info[0]
         self.dct_coeff = dct_coeff
         self.input_time_size = input_dim // dct_coeff
         self.input_frequency_size = dct_coeff
-        if pooling not in {"global", "temporal"}:
-            raise ValueError("pooling must be 'global' or 'temporal'")
-        if isinstance(temporal_bins, bool) or not isinstance(temporal_bins, int) or temporal_bins < 2:
-            raise ValueError("temporal_bins must be an integer >= 2")
-        self.pooling = pooling
-        self.temporal_bins = int(temporal_bins)
 
         layers_params = []
         idx = 1
@@ -81,16 +66,9 @@ class DSCNN(nn.Module):
                     )
                 )
 
-        # The historical global pool is retained as the default so old
-        # checkpoints load byte-for-byte.  ``temporal`` keeps an ordered set
-        # of coarse time bins (frequency is still averaged), preventing a
-        # keyword prefix/suffix from being treated as an order-free match.
         self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.temporal_pool = nn.AdaptiveAvgPool2d((self.temporal_bins, 1))
         self.dropout = nn.Dropout(0.3)
         self.final_fc = nn.Linear(layers_params[-1][0], label_count)
-        if self.pooling == "temporal":
-            self.temporal_fc = nn.Linear(layers_params[-1][0] * self.temporal_bins, label_count)
         self._initialize_weights()
 
     def _initialize_weights(self) -> None:
@@ -118,12 +96,8 @@ class DSCNN(nn.Module):
         x = x.reshape(batch_size, 1, self.input_time_size, self.input_frequency_size)
         for layer in self.conv_layers:
             x = layer(x)
-        if self.pooling == "temporal":
-            x = self.temporal_pool(x).squeeze(-1)
-            x = x.flatten(1)
-            x = self.dropout(x)
-            return self.temporal_fc(x)
         x = self.avg_pool(x).squeeze(-1).squeeze(-1)
+        self._pooled = x
         x = self.dropout(x)
         return self.final_fc(x)
 

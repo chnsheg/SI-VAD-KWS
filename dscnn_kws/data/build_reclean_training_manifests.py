@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import tempfile
 import uuid
@@ -17,7 +16,6 @@ DEFAULT_TRAIN_COUNT = 2_095_200
 DEFAULT_VALIDATION_COUNT = 7_360
 DEFAULT_TEST_COUNT = 21_282
 EXPECTED_POSITIVE_JITTER_MAX_MS = 200
-DEFAULT_SAMPLE_RATE = 16_000
 _METADATA_SHARD_COUNT = 4
 
 
@@ -67,14 +65,7 @@ def _lexical_absolute_path(value: Path) -> Path:
     return Path(os.path.abspath(os.path.expanduser(os.fspath(value))))
 
 
-def _training_record(
-    metadata_path: Path,
-    line_number: int,
-    row: object,
-    *,
-    min_positive_coverage_ratio: float | None = None,
-    coverage_aware_positive_jitter: bool = False,
-) -> dict[str, object]:
+def _training_record(metadata_path: Path, line_number: int, row: object) -> dict[str, object]:
     if not isinstance(row, Mapping):
         raise ValueError(f"Metadata row is not an object: {metadata_path}:{line_number}")
 
@@ -97,63 +88,6 @@ def _training_record(
                 "Positive metadata row has invalid online_window_jitter_max_ms "
                 f"at {metadata_path}:{line_number}: {jitter_max_ms!r}"
             )
-        # Positive windows may be translated by the online jitter policy.  A
-        # very large translation can leave only a small fraction of the
-        # detected keyword inside the one-second window while retaining a
-        # positive label, which teaches the classifier contradictory examples.
-        # Keep the historical permissive behavior by default, but provide an
-        # explicit build-time gate for production corpora.
-        if min_positive_coverage_ratio is not None:
-            coverage = row.get("coverage_ratio")
-            if isinstance(coverage, bool) or not isinstance(coverage, (int, float)) or not math.isfinite(float(coverage)):
-                raise ValueError(
-                    "Positive metadata row has no finite coverage_ratio "
-                    f"at {metadata_path}:{line_number}"
-                )
-            if not min_positive_coverage_ratio <= float(coverage) <= 1.0:
-                raise ValueError(
-                    "Positive metadata row coverage_ratio is below the configured minimum "
-                    f"at {metadata_path}:{line_number}: {coverage!r} < {min_positive_coverage_ratio}"
-                )
-        if coverage_aware_positive_jitter:
-            # The packed trainer applies jitter after loading the one-second
-            # record.  If the active span touches an edge, blindly retaining
-            # ±200 ms can move a substantial amount of the wake outside the
-            # window.  Cap the per-record jitter to the largest symmetric
-            # offset that preserves the requested visible-span ratio.
-            active_span = row.get("active_span")
-            if not isinstance(active_span, (list, tuple)) or len(active_span) != 2:
-                raise ValueError(
-                    "Positive metadata row has no active_span required for coverage-aware jitter "
-                    f"at {metadata_path}:{line_number}"
-                )
-            try:
-                active_start, active_end = int(active_span[0]), int(active_span[1])
-            except (TypeError, ValueError) as error:
-                raise ValueError(
-                    f"Positive metadata row has invalid active_span at {metadata_path}:{line_number}"
-                ) from error
-            if not 0 <= active_start < active_end <= DEFAULT_SAMPLE_RATE:
-                raise ValueError(
-                    f"Positive metadata row active_span is outside one-second window at {metadata_path}:{line_number}"
-                )
-            target_ratio = 0.0 if min_positive_coverage_ratio is None else float(min_positive_coverage_ratio)
-            if min_positive_coverage_ratio is None:
-                target_ratio = 0.8
-            max_requested_samples = round(jitter_max_ms * DEFAULT_SAMPLE_RATE / 1000)
-            active_len = active_end - active_start
-
-            def overlap(offset: int) -> int:
-                # Positive offset shifts the active span left in the output;
-                # negative offset shifts it right.
-                return max(0, min(active_end - offset, DEFAULT_SAMPLE_RATE) - max(active_start - offset, 0))
-
-            safe_samples = 0
-            for offset in range(max_requested_samples, -1, -1):
-                if min(overlap(-offset), overlap(offset)) / active_len >= target_ratio:
-                    safe_samples = offset
-                    break
-            jitter_max_ms = min(jitter_max_ms, int(safe_samples * 1000 // DEFAULT_SAMPLE_RATE))
     else:
         jitter_max_ms = 0
 
@@ -164,13 +98,7 @@ def _training_record(
     }
 
 
-def _stream_training_manifest(
-    metadata_paths: tuple[Path, ...],
-    destination: Path,
-    *,
-    min_positive_coverage_ratio: float | None = None,
-    coverage_aware_positive_jitter: bool = False,
-) -> tuple[Path, int]:
+def _stream_training_manifest(metadata_paths: tuple[Path, ...], destination: Path) -> tuple[Path, int]:
     descriptor, temporary_path = _temporary_file(destination)
     count = 0
     try:
@@ -186,19 +114,7 @@ def _stream_training_manifest(
                             row = json.loads(line)
                         except json.JSONDecodeError as error:
                             raise ValueError(f"Invalid metadata JSONL record: {metadata_path}:{line_number}") from error
-                        output.write(
-                            json.dumps(
-                                _training_record(
-                                    metadata_path,
-                                    line_number,
-                                    row,
-                                    min_positive_coverage_ratio=min_positive_coverage_ratio,
-                                    coverage_aware_positive_jitter=coverage_aware_positive_jitter,
-                                ),
-                                ensure_ascii=False,
-                            )
-                            + "\n"
-                        )
+                        output.write(json.dumps(_training_record(metadata_path, line_number, row), ensure_ascii=False) + "\n")
                         count += 1
             output.flush()
             os.fsync(output.fileno())
@@ -293,19 +209,11 @@ def build_reclean_training_manifests(
     expected_train_count: int = DEFAULT_TRAIN_COUNT,
     expected_validation_count: int = DEFAULT_VALIDATION_COUNT,
     expected_test_count: int = DEFAULT_TEST_COUNT,
-    min_positive_coverage_ratio: float | None = None,
-    coverage_aware_positive_jitter: bool = False,
 ) -> TrainingManifestBuildResult:
     """Create train/validation/test manifests without reading generated audio."""
     _validate_expected_count("expected_train_count", expected_train_count)
     _validate_expected_count("expected_validation_count", expected_validation_count)
     _validate_expected_count("expected_test_count", expected_test_count)
-    if min_positive_coverage_ratio is not None:
-        if isinstance(min_positive_coverage_ratio, bool) or not isinstance(min_positive_coverage_ratio, (int, float)):
-            raise ValueError("min_positive_coverage_ratio must be a finite number in [0, 1]")
-        min_positive_coverage_ratio = float(min_positive_coverage_ratio)
-        if not math.isfinite(min_positive_coverage_ratio) or not 0.0 <= min_positive_coverage_ratio <= 1.0:
-            raise ValueError("min_positive_coverage_ratio must be a finite number in [0, 1]")
 
     root = _lexical_absolute_path(Path(corpus_root))
     metadata_paths = tuple(root / "metadata" / f"shard-{index:02d}.jsonl" for index in range(_METADATA_SHARD_COUNT))
@@ -327,12 +235,7 @@ def build_reclean_training_manifests(
     temporary_validation: Path | None = None
     temporary_test: Path | None = None
     try:
-        temporary_train, train_count = _stream_training_manifest(
-            metadata_paths,
-            staging_train_path,
-            min_positive_coverage_ratio=min_positive_coverage_ratio,
-            coverage_aware_positive_jitter=coverage_aware_positive_jitter,
-        )
+        temporary_train, train_count = _stream_training_manifest(metadata_paths, staging_train_path)
         _check_count("Training", train_count, expected_train_count)
 
         temporary_validation, validation_count = _stage_manifest_copy(
@@ -371,23 +274,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-train-count", type=int, default=DEFAULT_TRAIN_COUNT)
     parser.add_argument("--expected-validation-count", type=int, default=DEFAULT_VALIDATION_COUNT)
     parser.add_argument("--expected-test-count", type=int, default=DEFAULT_TEST_COUNT)
-    parser.add_argument(
-        "--min-positive-coverage-ratio",
-        type=float,
-        default=None,
-        help=(
-            "Optional production gate for generated positive windows. "
-            "When set, every positive metadata row must include finite coverage_ratio >= this value."
-        ),
-    )
-    parser.add_argument(
-        "--coverage-aware-positive-jitter",
-        action="store_true",
-        help=(
-            "Cap each positive record's packed jitter using its active_span so the visible wake overlap "
-            "stays above the minimum coverage ratio (default 0.8 when no ratio is supplied)."
-        ),
-    )
     return parser
 
 
@@ -398,8 +284,6 @@ def main(argv: list[str] | None = None) -> int:
         expected_train_count=args.expected_train_count,
         expected_validation_count=args.expected_validation_count,
         expected_test_count=args.expected_test_count,
-        min_positive_coverage_ratio=args.min_positive_coverage_ratio,
-        coverage_aware_positive_jitter=args.coverage_aware_positive_jitter,
     )
     print(
         json.dumps(

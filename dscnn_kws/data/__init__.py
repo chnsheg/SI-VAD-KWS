@@ -1,15 +1,6 @@
 from typing import TYPE_CHECKING
 
-from .confirmation_pair import CONFIRMATION_PAIR_FORMAT, ConfirmationPairDataset, extract_adjacent_window_pairs
-from .dataset import SpeechCommandDataset, build_confirmation_pair_loader, build_dataloaders
-from .online_augmentation import (
-    NoiseCatalog,
-    OnlineAugmentedDataset,
-    OnlineWaveformAugmenter,
-    SnrBand,
-    SnrDistribution,
-    StratifiedRoleBatchSampler,
-)
+from .dataset import SpeechCommandDataset, build_dataloaders
 from .packed_mixture import CompositePackedDataset, StratifiedCompositeBatchSampler
 
 if TYPE_CHECKING:
@@ -38,21 +29,11 @@ def __getattr__(name: str):
 
 __all__ = [
     "SpeechCommandDataset",
-    "CONFIRMATION_PAIR_FORMAT",
-    "ConfirmationPairDataset",
-    "extract_adjacent_window_pairs",
     "CompositePackedDataset",
     "StratifiedCompositeBatchSampler",
-    "NoiseCatalog",
-    "OnlineAugmentedDataset",
-    "OnlineWaveformAugmenter",
-    "SnrBand",
-    "SnrDistribution",
-    "StratifiedRoleBatchSampler",
     "TrainingManifestBuildResult",
     "TrainingManifestPaths",
     "build_dataloaders",
-    "build_confirmation_pair_loader",
     "build_reclean_training_manifests",
     "resolve_current_training_manifests",
 ]

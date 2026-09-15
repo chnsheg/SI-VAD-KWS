@@ -22,7 +22,7 @@ class LSTM(nn.Module):
         super().__init__()
         self.dct_coeff = dct_coeff
         self.time_steps = input_dim // dct_coeff
-
+        
         # 使用 PyTorch 原生 LSTM，并通过投影层实现 LSTMP 结构
         # 如果 NUM_LAYERS > 1，每一层都会经过投影
         self.lstm = nn.LSTM(
@@ -33,7 +33,7 @@ class LSTM(nn.Module):
             dropout=DROPOUT if NUM_LAYERS > 1 else 0,
             bidirectional=False
         )
-
+        
         self.projection = nn.Linear(LSTM_UNITS, PROJECTION_UNITS)
         self.dropout = nn.Dropout(DROPOUT)
         self.final_fc = nn.Linear(PROJECTION_UNITS, label_count)
@@ -43,18 +43,18 @@ class LSTM(nn.Module):
         batch_size = x.size(0)
         # reshape to [batch, time, freq]
         x = x.view(batch_size, self.time_steps, self.dct_coeff)
-
+        
         # lstm_out shape: [batch, time, hidden_size]
         lstm_out, _ = self.lstm(x)
-
+        
         # 取最后一个时间步
         last_out = lstm_out[:, -1, :]
-
+        
         # 投影层
         proj_out = self.projection(last_out)
         proj_out = torch.relu(proj_out)
         proj_out = self.dropout(proj_out)
-
+        
         return self.final_fc(proj_out)
 
 class MFCCLSTM(nn.Module):
@@ -91,7 +91,6 @@ class MFCCLSTM(nn.Module):
         log_pwl_intercepts: list[float] | None,
         log_offset: float,
         log_input_clamp_min: float,
-        mfcc_scale: str = "torchaudio_db",
     ):
         super().__init__()
         self.backbone = backbone
@@ -101,21 +100,16 @@ class MFCCLSTM(nn.Module):
         self.pre_emphasis_coeff = pre_emphasis_coeff
         self.spec_aug = spec_aug
         self.mfcc_impl = mfcc_impl
-        if mfcc_scale not in {"natural_log", "torchaudio_db"}:
-            raise ValueError("mfcc_scale must be 'natural_log' or 'torchaudio_db'")
         self.mel_filter_shape = mel_filter_shape
 
         n_fft = int(sample_rate * window_size_ms / 1000)
         hop_length = int(sample_rate * window_stride_ms / 1000)
-
+        
         if frontend == "mfcc":
             if mfcc_impl == "torchaudio":
                 self.feature_extractor = MFCC(
                     sample_rate=sample_rate,
                     n_mfcc=40,
-                    # Keep the recurrent model on the same batch-invariant
-                    # fixed log-mel contract as MFCCDSCNN (see train.py).
-                    log_mels=(mfcc_scale == "natural_log"),
                     melkwargs={
                         "n_fft": n_fft,
                         "win_length": n_fft,
@@ -171,7 +165,7 @@ class MFCCLSTM(nn.Module):
                 log_offset=log_offset,
                 log_input_clamp_min=log_input_clamp_min,
             )
-
+            
         self.freq_mask = FrequencyMasking(freq_mask_param=max(1, spec_aug_freq_mask_param))
         self.time_mask = TimeMasking(time_mask_param=max(1, spec_aug_time_mask_param))
         self.spec_aug_num_freq_masks = max(0, spec_aug_num_freq_masks)
@@ -182,16 +176,16 @@ class MFCCLSTM(nn.Module):
             x = x.squeeze(1)
         if self.pre_emphasis:
             x = apply_pre_emphasis(x, self.pre_emphasis_coeff)
-
+        
         mfcc = self.feature_extractor(x)
-
+        
         if self.training and self.spec_aug:
             for _ in range(self.spec_aug_num_freq_masks):
                 mfcc = self.freq_mask(mfcc)
             for _ in range(self.spec_aug_num_time_masks):
                 mfcc = self.time_mask(mfcc)
-
+                
         mfcc = mfcc[:, : self.dct_coeff, :]
         mfcc = mfcc.permute(0, 2, 1).reshape(mfcc.size(0), -1)
-
+        
         return self.backbone(mfcc)

@@ -9,14 +9,13 @@ from datetime import datetime
 import torch
 import torch.nn as nn
 from torch import optim
-from torchaudio.functional import create_dct
-from torchaudio.transforms import FrequencyMasking, MFCC, MelSpectrogram, TimeMasking
+from torchaudio.transforms import FrequencyMasking, MFCC, TimeMasking
 
 from dscnn_kws.configs import CLASS_ENCODING, CLASS_LIST, DEFAULT_MODEL_SIZE_INFO
-from dscnn_kws.data import build_confirmation_pair_loader, build_dataloaders
+from dscnn_kws.data import build_dataloaders
 from dscnn_kws.engine import Trainer
 from dscnn_kws.frontend import TorchBandpass, TorchMFCC, load_log_pwl_json
-from dscnn_kws.model import CepstralTCN, DSCNN, LSTM, MFCCLSTM
+from dscnn_kws.model import DSCNN, LSTM, MFCCLSTM
 from dscnn_kws.model.dscnn import calculate_time_steps
 from dscnn_kws.utils import apply_pre_emphasis, parameter_number, prepare_device, set_random_seed, verify_dataset_sample_rate
 from dscnn_kws.utils import barrier, destroy_distributed, init_distributed, is_rank_zero
@@ -69,21 +68,19 @@ class WarmupCosineScheduler:
         self._set_lrs(self.last_step)
 
 
-class BatchInvariantMFCC(nn.Module):
-    """Per-item torchaudio-compatible dB MFCC without batch-dependent top_db."""
+class _GradientReversal(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, lambd: float) -> torch.Tensor:
+        ctx.lambd = float(lambd)
+        return x.view_as(x)
 
-    def __init__(self, sample_rate: int, n_mfcc: int, melkwargs: dict[str, object]) -> None:
-        super().__init__()
-        melkwargs = dict(melkwargs)
-        n_mels = int(melkwargs.get("n_mels", 128))
-        self.mel_spectrogram = MelSpectrogram(sample_rate=sample_rate, **melkwargs)
-        self.register_buffer("dct_mat", create_dct(n_mfcc, n_mels, norm="ortho"))
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return -ctx.lambd * grad_output, None
 
-    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
-        mel = self.mel_spectrogram(waveform)
-        db = 10.0 * torch.log10(mel.clamp_min(1e-10))
-        db = torch.maximum(db, db.amax(dim=(-2, -1), keepdim=True) - 80.0)
-        return torch.matmul(db.transpose(-1, -2), self.dct_mat).transpose(-1, -2)
+
+def _grad_reverse(x: torch.Tensor, lambd: float) -> torch.Tensor:
+    return _GradientReversal.apply(x, lambd)
 
 
 class MFCCDSCNN(nn.Module):
@@ -119,11 +116,34 @@ class MFCCDSCNN(nn.Module):
         log_pwl_intercepts: list[float] | None,
         log_offset: float,
         log_input_clamp_min: float,
+        pcmn_alpha: float | None = None,
+        pcmn_delta: float = 1.0,
+        pcmn_num_drop: int = 0,
+        pcmn_blend_w: float = 0.0,
+        frontend_delta: bool = False,
+        pcen_t: float | None = None,
+        pcen_gain: float = 1.0,
+        pcen_power: float = 0.5,
+        pcen_eps: float = 1e-6,
+        pcen_stats_file: str | None = None,
+        pcen_blend_w: float = 0.0,
+        domain_classes: int = 0,
+        daat_lambda: float = 0.0,
         amp_backbone: bool = False,
-        mfcc_scale: str = "torchaudio_db",
-        mfcc_c0_cmn: bool = False,
     ):
         super().__init__()
+        self.frontend_delta = bool(frontend_delta)
+        self.pcen_t = None if pcen_t is None else float(pcen_t)
+        self.pcen_gain = float(pcen_gain)
+        self.pcen_power = float(pcen_power)
+        self.pcen_eps = float(pcen_eps)
+        self.pcen_blend_w = float(pcen_blend_w)
+        self.domain_classes = int(domain_classes)
+        self.daat_lambda = float(daat_lambda)
+        if self.domain_classes > 0:
+            self.domain_head = nn.Sequential(
+                nn.Linear(64, 64), nn.ReLU(), nn.Linear(64, self.domain_classes)
+            )
         self.backbone = backbone
         self.frontend = frontend
         self.dct_coeff = dct_coeff
@@ -131,20 +151,23 @@ class MFCCDSCNN(nn.Module):
         self.pre_emphasis_coeff = pre_emphasis_coeff
         self.spec_aug = spec_aug
         self.mfcc_impl = mfcc_impl
-        if mfcc_scale not in {"natural_log", "torchaudio_db"}:
-            raise ValueError("mfcc_scale must be 'natural_log' or 'torchaudio_db'")
-        self.mfcc_scale = mfcc_scale
-        self.mfcc_c0_cmn = bool(mfcc_c0_cmn)
-        if self.mfcc_c0_cmn and frontend != "mfcc":
-            raise ValueError("mfcc_c0_cmn requires frontend='mfcc'")
         self.mel_filter_shape = mel_filter_shape
         self.amp_backbone = amp_backbone
+        self.pcmn_alpha = None if pcmn_alpha is None else float(pcmn_alpha)
+        self.pcmn_delta = float(pcmn_delta)
+        self.pcmn_num_drop = int(pcmn_num_drop)
+        self.pcmn_blend_w = float(pcmn_blend_w)
+        if self.pcmn_alpha is not None and mfcc_impl != "torch":
+            raise ValueError("PCMN requires --mfcc_impl torch (torchaudio MFCC is a closed block)")
 
         n_fft = int(sample_rate * window_size_ms / 1000)
         hop_length = int(sample_rate * window_stride_ms / 1000)
         if frontend == "mfcc":
             if mfcc_impl == "torchaudio":
-                melkwargs = {
+                self.feature_extractor = MFCC(
+                    sample_rate=sample_rate,
+                    n_mfcc=40,
+                    melkwargs={
                         "n_fft": n_fft,
                         "win_length": n_fft,
                         "hop_length": hop_length,
@@ -153,16 +176,8 @@ class MFCCDSCNN(nn.Module):
                         "f_max": int(sample_rate / 2),
                         "window_fn": torch.hann_window,
                         "center": True,
-                    }
-                if mfcc_scale == "torchaudio_db":
-                    self.feature_extractor = BatchInvariantMFCC(sample_rate, 40, melkwargs)
-                else:
-                    self.feature_extractor = MFCC(
-                        sample_rate=sample_rate,
-                        n_mfcc=40,
-                        log_mels=True,
-                        melkwargs=melkwargs,
-                    )
+                    },
+                )
             else:
                 self.feature_extractor = TorchMFCC(
                     sample_rate=sample_rate,
@@ -185,6 +200,16 @@ class MFCCDSCNN(nn.Module):
                     log_pwl_intercepts=log_pwl_intercepts,
                     log_offset=log_offset,
                     log_input_clamp_min=log_input_clamp_min,
+                    pcmn_alpha=pcmn_alpha,
+                    pcmn_delta=pcmn_delta,
+                    pcmn_num_drop=pcmn_num_drop,
+                    pcmn_blend_w=pcmn_blend_w,
+                    pcen_t=pcen_t,
+                    pcen_gain=pcen_gain,
+                    pcen_power=pcen_power,
+                    pcen_eps=pcen_eps,
+                    pcen_stats_file=pcen_stats_file,
+                    pcen_blend_w=pcen_blend_w,
                 )
         else:
             self.feature_extractor = TorchBandpass(
@@ -218,51 +243,39 @@ class MFCCDSCNN(nn.Module):
         x = x.float()
         if self.pre_emphasis:
             x = apply_pre_emphasis(x, self.pre_emphasis_coeff)
-        # torchaudio.MFCC uses AmplitudeToDB(top_db=80) by default.  When
-        # called with [B, T], its 3-D mel tensor is interpreted as one
-        # ``(channel, frequency, time)`` block and the top-dB reference is
-        # shared across the whole batch.  Consequently a sample's features
-        # (and score) depend on which other utterances happen to be in the
-        # batch; realtime inference (B=1) then disagrees with training.
-        # Keep the historical dB transform while making the leading batch
-        # dimension explicit as a non-reduced axis: [B, 1, T] ->
-        # [B, 1, n_mels, frames].  amplitude_to_DB reduces only the final
-        # three dimensions, yielding an independent cutoff per sample.
-        mfcc = self.feature_extractor(x.unsqueeze(1) if self.mfcc_impl == "torchaudio" else x).float()
-        if mfcc.dim() == 4 and mfcc.size(1) == 1:
-            mfcc = mfcc.squeeze(1)
-        if bool(getattr(self, "mfcc_c0_cmn", False)):
-            c0 = mfcc[:, :1, :]
-            mfcc = torch.cat((c0 - c0.mean(dim=-1, keepdim=True), mfcc[:, 1:, :]), dim=1)
+        mfcc = self.feature_extractor(x).float()
         if self.training and self.spec_aug:
             for _ in range(self.spec_aug_num_freq_masks):
                 mfcc = self.freq_mask(mfcc)
             for _ in range(self.spec_aug_num_time_masks):
                 mfcc = self.time_mask(mfcc)
         mfcc = mfcc[:, : self.dct_coeff, :]
+        if self.frontend_delta:
+            if mfcc.size(2) > 1:
+                d = mfcc[:, :, 1:] - mfcc[:, :, :-1]
+                delta = torch.cat([torch.zeros_like(mfcc[:, :, :1]), d], dim=2)
+            else:
+                delta = torch.zeros_like(mfcc)
+            mfcc = torch.cat([mfcc, delta], dim=1)
         mfcc = mfcc.permute(0, 2, 1).reshape(mfcc.size(0), -1)
         if self.amp_backbone and mfcc.is_cuda:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = self.backbone(mfcc)
             return logits.float()
-        return self.backbone(mfcc)
+        logits = self.backbone(mfcc)
+        if self.domain_classes > 0 and self.training:
+            feats = self.backbone._pooled
+            dom = self.domain_head(_grad_reverse(feats, self.daat_lambda))
+            return logits, dom
+        return logits
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="DSCNN-only KWS training")
-    parser.add_argument("--model", choices=["dscnn", "cepstral_tcn", "lstm"], default="dscnn")
+    parser.add_argument("--model", choices=["dscnn", "lstm"], default="dscnn")
     parser.add_argument("--epoch", default=50, type=int)
     parser.add_argument("--save_dir", default=None, type=str)
     parser.add_argument("--resume", default=None, type=str)
-    parser.add_argument(
-        "--temporal_init_from_global",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "将旧 global-pooling DSCNN checkpoint 迁移为 temporal head 的初始化；"
-            "仅复制网络权重并从 epoch 1/新优化器开始训练"
-        ),
-    )
     parser.add_argument("--run_name", default=None, type=str)
     parser.add_argument("--log_interval", default=50, type=int)
     parser.add_argument("--live_telemetry", action=argparse.BooleanOptionalAction, default=False)
@@ -274,42 +287,19 @@ def parse_args():
     parser.add_argument("--ddp_static_graph", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ddp_gradient_as_bucket_view", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--amp_backbone", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--freeze_backbone", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--trainable_tail_blocks", default=0, type=int)
-    parser.add_argument(
-        "--freeze_tail_batch_norm_stats",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Keep BatchNorm running statistics fixed in trainable DSCNN tail blocks while "
-            "leaving their affine weight and bias trainable"
-        ),
-    )
+    parser.add_argument("--frontend_delta", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--pcen_t", default=None, type=float)
+    parser.add_argument("--pcen_gain", default=1.0, type=float)
+    parser.add_argument("--pcen_power", default=0.5, type=float)
+    parser.add_argument("--pcen_eps", default=1e-6, type=float)
+    parser.add_argument("--pcen_stats", default=None, type=str)
+    parser.add_argument("--pcen_blend_w", default=0.0, type=float)
+    parser.add_argument("--domain_classes", default=0, type=int)
+    parser.add_argument("--daat_lambda", default=0.0, type=float)
     parser.add_argument("--max_train_steps", default=None, type=int)
     parser.add_argument("--offline_augmented_dataset", action="store_true", default=False)
     parser.add_argument("--online_window_jitter_ms", default=None, type=int)
     parser.add_argument("--train_manifest", default="", type=str)
-    parser.add_argument(
-        "--pair_train_manifest",
-        default="",
-        type=str,
-        help="显式连续双窗训练 JSONL；必须与 --pair_objective 一起使用",
-    )
-    parser.add_argument("--pair_hop_ms", default=96.0, type=float)
-    parser.add_argument("--pair_batch", default=None, type=int)
-    parser.add_argument(
-        "--pair_positive_per_batch",
-        default=0,
-        type=int,
-        help="每个 rank 的 pair batch 固定正例数；0 保持历史 shuffle，r14 显式启用",
-    )
-    parser.add_argument("--pair_num_workers", default=None, type=int)
-    parser.add_argument(
-        "--pair_interval",
-        default=1,
-        type=int,
-        help="每 N 个基础分类 step 计算一次相邻双窗辅助损失",
-    )
     parser.add_argument("--validation_manifest", default="", type=str)
     parser.add_argument("--test_manifest", default="", type=str)
     parser.add_argument("--packed_train_index", default="", type=str)
@@ -317,8 +307,8 @@ def parse_args():
     parser.add_argument("--mixture_base_pack", default="", type=str)
     parser.add_argument("--mixture_raw_anchor_pack", default="", type=str)
     parser.add_argument("--mixture_hard_negative_pack", default="", type=str)
+    parser.add_argument("--mixture_low_snr_positive_pack", default="", type=str)
     parser.add_argument("--mixture-v3-role", dest="mixture_v3_role", action="append", default=[])
-    parser.add_argument("--mixture-v3-quota", dest="mixture_v3_quota", action="append", default=[])
     parser.add_argument(
         "--mixture-v3-allow-replacement-role",
         dest="mixture_v3_allow_replacement_role",
@@ -330,7 +320,6 @@ def parse_args():
     parser.add_argument("--min_positive_recall", default=0.0, type=float)
     parser.add_argument("--early_stopping_min_epoch", default=0, type=int)
     parser.add_argument("--early_stopping_patience", default=0, type=int)
-    parser.add_argument("--candidate-checkpoint-every", default=0, type=int)
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument(
         "--non_deterministic",
@@ -342,8 +331,6 @@ def parse_args():
     parser.add_argument("--dataset", default="speech_commands_v0.02_sr8k", type=str)
     parser.add_argument("--num_workers", default=8, type=int)
     parser.add_argument("--prefetch_factor", default=4, type=int)
-    parser.add_argument("--packed_loader_workers", default=1, type=int)
-    parser.add_argument("--packed_prefetch_factor", default=1, type=int)
     parser.add_argument("--noise_aug", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--eval_noise_aug", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--noise_roots", nargs="*", default=None)
@@ -353,64 +340,6 @@ def parse_args():
     parser.add_argument("--noise_aug_prob", default=0.8, type=float)
     parser.add_argument("--noise_snr_min_db", default=-5.0, type=float)
     parser.add_argument("--noise_snr_max_db", default=20.0, type=float)
-    parser.add_argument(
-        "--online-augment-profile",
-        dest="online_augment_profile",
-        choices=["none", "nihao_wenwen_v1"],
-        default="none",
-        help="Enable role-aware online waveform mixing without materializing augmented WAV files",
-    )
-    parser.add_argument(
-        "--online-noise-domain",
-        dest="online_noise_domain",
-        action="append",
-        default=[],
-        metavar="NAME=PATH",
-        help="Noise WAV, directory, or path-list grouped as a sampling domain; repeatable",
-    )
-    parser.add_argument(
-        "--online-noise-domain-weight",
-        dest="online_noise_domain_weight",
-        action="append",
-        default=[],
-        metavar="NAME=WEIGHT",
-    )
-    parser.add_argument(
-        "--online-positive-snr-band",
-        dest="online_positive_snr_band",
-        action="append",
-        default=[],
-        metavar="LOW:HIGH:WEIGHT",
-    )
-    parser.add_argument(
-        "--online-negative-snr-band",
-        dest="online_negative_snr_band",
-        action="append",
-        default=[],
-        metavar="LOW:HIGH:WEIGHT",
-    )
-    parser.add_argument(
-        "--online-hard-negative-snr-band",
-        dest="online_hard_negative_snr_band",
-        action="append",
-        default=[],
-        metavar="LOW:HIGH:WEIGHT",
-    )
-    parser.add_argument(
-        "--online-role-quota",
-        dest="online_role_quota",
-        action="append",
-        default=[],
-        metavar="ROLE=COUNT",
-        help="Exact per-rank batch counts; defaults to 50%% positive and 20%% hard negative when available",
-    )
-    parser.add_argument(
-        "--online-steps-per-epoch",
-        dest="online_steps_per_epoch",
-        default=0,
-        type=int,
-        help="Role-balanced updates per epoch; 0 uses ceil(dataset_size / batch_size)",
-    )
     parser.add_argument("--eval_noise_aug_prob", default=None, type=float)
     parser.add_argument("--eval_noise_snr_min_db", default=None, type=float)
     parser.add_argument("--eval_noise_snr_max_db", default=None, type=float)
@@ -425,13 +354,6 @@ def parse_args():
     parser.add_argument("--window_size_ms", default=32, type=int)
     parser.add_argument("--window_stride_ms", default=32, type=int)
     parser.add_argument("--model_size_info", nargs="+", type=int, default=DEFAULT_MODEL_SIZE_INFO)
-    parser.add_argument("--pooling", choices=["global", "temporal"], default="global")
-    parser.add_argument("--temporal_bins", default=4, type=int)
-    parser.add_argument("--tcn_channels", default=68, type=int)
-    parser.add_argument("--tcn_blocks", default=4, type=int)
-    parser.add_argument("--tcn_kernel_size", default=3, type=int)
-    parser.add_argument("--tcn_dilations", nargs="+", default=[1, 1, 2, 2], type=int)
-    parser.add_argument("--tcn_temporal_bins", default=8, type=int)
     parser.add_argument("--bandpass_n_bands", default=16, type=int)
     parser.add_argument("--bandpass_f_min", default=200.0, type=float)
     parser.add_argument("--bandpass_f_max", default=4000.0, type=float)
@@ -453,36 +375,19 @@ def parse_args():
     parser.add_argument("--gamma", default=0.2, type=float)
     parser.add_argument("--warmup_steps", default=0, type=int)
     parser.add_argument("--label_smoothing", default=0.0, type=float)
-    parser.add_argument(
-        "--pair_objective",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="训练显式相邻两窗 [B,2,C,T]，使损失对齐部署端连续两帧确认规则",
-    )
-    parser.add_argument("--pair_runtime_threshold", default=0.8, type=float)
-    parser.add_argument("--pair_softmin_temperature", default=0.25, type=float)
-    parser.add_argument("--pair_positive_margin", default=0.0, type=float)
-    parser.add_argument("--pair_negative_margin", default=0.0, type=float)
-    parser.add_argument("--pair_frame_ce_weight", default=1.0, type=float)
-    parser.add_argument("--pair_positive_weight", default=1.0, type=float)
-    parser.add_argument("--pair_positive_hinge_tail_fraction", default=1.0, type=float)
-    parser.add_argument("--pair_negative_weight", default=1.0, type=float)
-    parser.add_argument("--pair_negative_cvar_fraction", default=0.1, type=float)
-    parser.add_argument("--pair_negative_source_cvar_fraction", default=1.0, type=float)
-    parser.add_argument("--pair_negative_frame_target_probability", default=0.5, type=float)
-    parser.add_argument("--pair_negative_frame_weight", default=0.0, type=float)
-    parser.add_argument("--pair_tail_ranking_weight", default=0.0, type=float)
-    parser.add_argument("--pair_tail_ranking_margin", default=0.0, type=float)
-    parser.add_argument("--pair_positive_tail_fraction", default=0.1, type=float)
-    parser.add_argument("--pair_objective_weight", default=1.0, type=float)
+    parser.add_argument("--positive_loss_weight", default=1.0, type=float)
+    parser.add_argument("--random_gain_db", default=0.0, type=float)
+    parser.add_argument("--loss_type", default="ce", choices=["ce", "margin"], type=str)
+    parser.add_argument("--margin_neg_anchor", default=0.5, type=float)
+    parser.add_argument("--margin_pos_anchor", default=0.9, type=float)
+    parser.add_argument("--margin_pos_weight", default=2.0, type=float)
+    parser.add_argument("--margin_neg_weight", default=1.0, type=float)
     parser.add_argument("--spec_aug", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--spec_aug_freq_mask_param", default=1, type=int)
     parser.add_argument("--spec_aug_time_mask_param", default=1, type=int)
     parser.add_argument("--spec_aug_num_freq_masks", default=1, type=int)
     parser.add_argument("--spec_aug_num_time_masks", default=1, type=int)
     parser.add_argument("--mfcc_impl", choices=["torchaudio", "torch"], default="torchaudio")
-    parser.add_argument("--mfcc_scale", choices=["natural_log", "torchaudio_db"], default="torchaudio_db")
-    parser.add_argument("--mfcc_c0_cmn", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--mel_filter_shape", choices=["triangular", "rectangular"], default="triangular")
     parser.add_argument("--log_approx_mode", choices=["exact", "pwl"], default="exact")
     parser.add_argument("--log_pwl_num_segments", default=6, type=int)
@@ -491,6 +396,10 @@ def parse_args():
     parser.add_argument("--log_pwl_fit_json", default=None, type=str)
     parser.add_argument("--log_offset", default=1e-6, type=float)
     parser.add_argument("--log_input_clamp_min", default=1e-12, type=float)
+    parser.add_argument("--pcmn_alpha", default=None, type=float)
+    parser.add_argument("--pcmn_delta", default=1.0, type=float)
+    parser.add_argument("--pcmn_num_drop", default=0, type=int)
+    parser.add_argument("--pcmn_blend_w", default=0.0, type=float)
     return parser.parse_args()
 
 
@@ -524,16 +433,13 @@ def wrap_distributed_model(
 
 
 def build_optimizer_scheduler(args, model: nn.Module):
-    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    if not trainable_parameters:
-        raise ValueError("optimizer has no trainable parameters")
     if args.opt == "adam":
-        optimizer = optim.Adam(trainable_parameters, lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     elif args.opt == "adamw":
-        optimizer = optim.AdamW(trainable_parameters, lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     else:
         optimizer = optim.SGD(
-            trainable_parameters,
+            model.parameters(),
             lr=args.lr,
             momentum=getattr(args, "momentum", 0.9),
             nesterov=True,
@@ -571,68 +477,6 @@ def build_optimizer_scheduler(args, model: nn.Module):
     if warmup_steps == 0:
         setattr(args, "scheduler_step_per_batch", False)
     return optimizer, scheduler
-
-
-def _active_dscnn_classifier(backbone: nn.Module) -> tuple[str, nn.Module]:
-    classifier_name = "temporal_fc" if getattr(backbone, "pooling", "global") == "temporal" else "final_fc"
-    classifier = getattr(backbone, classifier_name, None)
-    if classifier is None:
-        raise ValueError(f"freeze_backbone requires a DSCNN backbone.{classifier_name} classifier")
-    return classifier_name, classifier
-
-
-def configure_frozen_dscnn_trainable_tail(model: nn.Module, *, tail_blocks: int = 0) -> tuple[str, ...]:
-    """Freeze a DSCNN except for its active classifier and an optional convolutional tail."""
-    if tail_blocks < 0:
-        raise ValueError("tail_blocks must be non-negative")
-    backbone = getattr(model, "backbone", None)
-    conv_layers = getattr(backbone, "conv_layers", None)
-    if backbone is None or conv_layers is None:
-        raise ValueError("freeze_backbone requires a DSCNN backbone with conv_layers and a classifier")
-    classifier_name, classifier = _active_dscnn_classifier(backbone)
-    if tail_blocks > len(conv_layers):
-        raise ValueError(f"tail_blocks={tail_blocks} exceeds DSCNN depth={len(conv_layers)}")
-
-    tail_start = len(conv_layers) - tail_blocks
-    classifier_prefix = f"backbone.{classifier_name}."
-    trainable_prefixes = [classifier_prefix]
-    trainable_prefixes.extend(f"backbone.conv_layers.{index}." for index in range(tail_start, len(conv_layers)))
-    trainable_names = tuple(
-        name for name, _ in model.named_parameters() if any(name.startswith(prefix) for prefix in trainable_prefixes)
-    )
-    classifier_parameter_names = {f"{classifier_prefix}{name}" for name, _ in classifier.named_parameters()}
-    if not trainable_names or not classifier_parameter_names.issubset(trainable_names):
-        raise ValueError(f"freeze_backbone requires a DSCNN backbone.{classifier_name} classifier")
-    for name, parameter in model.named_parameters():
-        parameter.requires_grad_(name in trainable_names)
-    return trainable_names
-
-
-def freeze_backbone_except_final_fc(model: nn.Module) -> tuple[str, ...]:
-    """Freeze DSCNN feature layers while retaining its active binary classifier."""
-    return configure_frozen_dscnn_trainable_tail(model, tail_blocks=0)
-
-
-def set_frozen_backbone_eval(
-    model: nn.Module,
-    *,
-    freeze_tail_batch_norm_stats: bool = False,
-) -> None:
-    """Keep frozen DSCNN modules in eval mode while training the configured tail."""
-    backbone = getattr(model, "backbone", None)
-    conv_layers = getattr(backbone, "conv_layers", None)
-    if backbone is None or conv_layers is None:
-        raise ValueError("freeze_backbone requires a DSCNN backbone with conv_layers and a classifier")
-    _, classifier = _active_dscnn_classifier(backbone)
-    backbone.eval()
-    for layer in conv_layers:
-        if any(parameter.requires_grad for parameter in layer.parameters()):
-            layer.train()
-            if freeze_tail_batch_norm_stats:
-                for module in layer.modules():
-                    if isinstance(module, nn.modules.batchnorm._BatchNorm):
-                        module.eval()
-    classifier.train()
 
 
 def configure_scheduler_total_steps(args, train_loader) -> None:
@@ -746,31 +590,12 @@ def main():
     normalize_offline_data_args(args)
     if getattr(args, "max_train_steps", None) is not None and args.max_train_steps < 1:
         raise ValueError("--max_train_steps must be positive")
-    if bool(getattr(args, "temporal_init_from_global", False)) and not getattr(args, "resume", None):
-        raise ValueError("--temporal_init_from_global requires --resume pointing to a global-pooling checkpoint")
-    if bool(getattr(args, "temporal_init_from_global", False)) and args.model != "dscnn":
-        raise ValueError("--temporal_init_from_global is supported only for DSCNN")
-    if not 0.0 <= getattr(args, "min_positive_recall", 0.0) <= 1.0:
+    if not 0.0 <= args.min_positive_recall <= 1.0:
         raise ValueError("--min_positive_recall must be in [0, 1]")
-    if getattr(args, "early_stopping_min_epoch", 0) < 0:
+    if args.early_stopping_min_epoch < 0:
         raise ValueError("--early_stopping_min_epoch must be non-negative")
-    if getattr(args, "early_stopping_patience", 0) < 0:
+    if args.early_stopping_patience < 0:
         raise ValueError("--early_stopping_patience must be non-negative")
-    if getattr(args, "candidate_checkpoint_every", 0) < 0:
-        raise ValueError("--candidate-checkpoint-every must be non-negative")
-    freeze_backbone = bool(getattr(args, "freeze_backbone", False))
-    trainable_tail_blocks = int(getattr(args, "trainable_tail_blocks", 0))
-    if freeze_backbone and args.model != "dscnn":
-        raise ValueError("--freeze_backbone is supported only for DSCNN")
-    if trainable_tail_blocks < 0:
-        raise ValueError("--trainable_tail_blocks must be non-negative")
-    if trainable_tail_blocks and not freeze_backbone:
-        raise ValueError("--trainable_tail_blocks requires --freeze_backbone")
-    freeze_tail_batch_norm_stats = bool(getattr(args, "freeze_tail_batch_norm_stats", False))
-    if freeze_tail_batch_norm_stats and not freeze_backbone:
-        raise ValueError("--freeze_tail_batch_norm_stats requires --freeze_backbone")
-    if freeze_tail_batch_norm_stats and trainable_tail_blocks == 0:
-        raise ValueError("--freeze_tail_batch_norm_stats requires --trainable_tail_blocks greater than zero")
     if args.frontend == "bandpass" and args.dct_coeff != args.bandpass_n_bands:
         raise ValueError(
             f"For bandpass frontend, dct_coeff must equal bandpass_n_bands. "
@@ -821,37 +646,18 @@ def main():
                 )
 
             train_loader, valid_loader, test_loader = build_dataloaders(data_path, CLASS_LIST, CLASS_ENCODING, args)
-            pair_steps_per_epoch = math.ceil(len(train_loader) / int(getattr(args, "pair_interval", 1)))
-            pair_train_loader = build_confirmation_pair_loader(
-                CLASS_ENCODING,
-                args,
-                steps_per_epoch=pair_steps_per_epoch,
-            )
             configure_scheduler_total_steps(args, train_loader)
 
             time_steps = calculate_time_steps(args.sample_rate, args.window_stride_ms)
-            input_dim = time_steps * args.dct_coeff
+            _feat_ch = args.dct_coeff * (2 if getattr(args, "frontend_delta", False) else 1)
+            input_dim = time_steps * _feat_ch
 
             if args.model == "dscnn":
                 backbone = DSCNN(
                     input_dim=input_dim,
                     label_count=len(CLASS_LIST),
                     model_size_info=args.model_size_info,
-                    dct_coeff=args.dct_coeff,
-                    pooling=args.pooling,
-                    temporal_bins=args.temporal_bins,
-                )
-                wrapper_class = MFCCDSCNN
-            elif args.model == "cepstral_tcn":
-                backbone = CepstralTCN(
-                    input_dim=input_dim,
-                    label_count=len(CLASS_LIST),
-                    dct_coeff=args.dct_coeff,
-                    channels=args.tcn_channels,
-                    num_blocks=args.tcn_blocks,
-                    kernel_size=args.tcn_kernel_size,
-                    dilations=args.tcn_dilations,
-                    temporal_bins=args.tcn_temporal_bins,
+                    dct_coeff=_feat_ch,
                 )
                 wrapper_class = MFCCDSCNN
             else:
@@ -881,7 +687,19 @@ def main():
                 "spec_aug_num_freq_masks": args.spec_aug_num_freq_masks,
                 "spec_aug_num_time_masks": args.spec_aug_num_time_masks,
                 "mfcc_impl": args.mfcc_impl,
-                "mfcc_scale": args.mfcc_scale,
+                "frontend_delta": getattr(args, "frontend_delta", False),
+                "pcmn_alpha": args.pcmn_alpha,
+                "pcmn_delta": args.pcmn_delta,
+                "pcmn_num_drop": args.pcmn_num_drop,
+                "pcmn_blend_w": args.pcmn_blend_w,
+                "pcen_t": getattr(args, "pcen_t", None),
+                "pcen_gain": getattr(args, "pcen_gain", 1.0),
+                "pcen_power": getattr(args, "pcen_power", 0.5),
+                "pcen_eps": getattr(args, "pcen_eps", 1e-6),
+                "pcen_stats_file": getattr(args, "pcen_stats", None),
+                "pcen_blend_w": getattr(args, "pcen_blend_w", 0.0),
+                "domain_classes": int(getattr(args, "domain_classes", 0)),
+                "daat_lambda": float(getattr(args, "daat_lambda", 0.0)),
                 "mel_filter_shape": args.mel_filter_shape,
                 "log_approx_mode": args.log_approx_mode,
                 "log_pwl_num_segments": args.log_pwl_num_segments,
@@ -892,16 +710,26 @@ def main():
                 "log_pwl_intercepts": log_pwl_intercepts,
                 "log_offset": args.log_offset,
                 "log_input_clamp_min": args.log_input_clamp_min,
+                "frontend_delta": getattr(args, "frontend_delta", False),
+                "pcmn_alpha": args.pcmn_alpha,
+                "pcmn_delta": args.pcmn_delta,
+                "pcmn_num_drop": args.pcmn_num_drop,
+                "pcmn_blend_w": args.pcmn_blend_w,
+                "pcen_t": getattr(args, "pcen_t", None),
+                "pcen_gain": getattr(args, "pcen_gain", 1.0),
+                "pcen_power": getattr(args, "pcen_power", 0.5),
+                "pcen_eps": getattr(args, "pcen_eps", 1e-6),
+                "pcen_stats_file": getattr(args, "pcen_stats", None),
+                "pcen_blend_w": getattr(args, "pcen_blend_w", 0.0),
+                "domain_classes": int(getattr(args, "domain_classes", 0)),
+                "daat_lambda": float(getattr(args, "daat_lambda", 0.0)),
             }
-            if args.model in {"dscnn", "cepstral_tcn"}:
+            if args.model == "dscnn":
                 wrapper_kwargs["amp_backbone"] = bool(getattr(args, "amp_backbone", False))
-                wrapper_kwargs["mfcc_c0_cmn"] = bool(getattr(args, "mfcc_c0_cmn", False))
+            else:
+                for _k in ("pcmn_alpha", "pcmn_delta", "pcmn_num_drop", "pcmn_blend_w"):
+                    wrapper_kwargs.pop(_k, None)
             model = wrapper_class(**wrapper_kwargs).to(device)
-            frozen_parameter_names: tuple[str, ...] = ()
-            if freeze_backbone:
-                frozen_parameter_names = configure_frozen_dscnn_trainable_tail(
-                    model, tail_blocks=trainable_tail_blocks
-                )
             if args.distributed:
                 model = wrap_distributed_model(
                     model,
@@ -938,15 +766,10 @@ def main():
                     print(f"[INFO] valid_noise_roots={args.valid_noise_roots}")
                     print(f"[INFO] test_noise_roots={args.test_noise_roots}")
                 print(f"[INFO] frontend={args.frontend}")
-                if frozen_parameter_names:
-                    print(
-                        f"[INFO] freeze_backbone=ON, trainable_tail_blocks={trainable_tail_blocks}, "
-                        f"freeze_tail_batch_norm_stats={freeze_tail_batch_norm_stats}, "
-                        f"trainable_parameters={list(frozen_parameter_names)}"
-                    )
                 print(f"[INFO] mfcc_impl={args.mfcc_impl}")
                 print(f"[INFO] mel_filter_shape={args.mel_filter_shape}")
                 print(f"[INFO] log_approx_mode={args.log_approx_mode}")
+                print(f"[INFO] pcmn: alpha={args.pcmn_alpha}, delta={args.pcmn_delta}, num_drop={args.pcmn_num_drop}, blend_w={args.pcmn_blend_w}")
             if args.frontend == "bandpass" and is_rank_zero():
                 print(
                     f"[INFO] bandpass: n_bands={args.bandpass_n_bands}, "
@@ -977,7 +800,6 @@ def main():
                 device=device,
                 save_dir=save_dir,
                 artifact_writer=artifact_writer,
-                pair_train_loader=pair_train_loader,
             )
             return trainer.fit()
 

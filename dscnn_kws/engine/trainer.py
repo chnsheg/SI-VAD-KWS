@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import hashlib
 import math
 import os
 import tempfile
 import time
 import warnings
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import torch
@@ -14,7 +12,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from dscnn_kws.engine.confirmation_pair import ConfirmationPairLoss
 from dscnn_kws.utils.distributed import barrier, is_rank_zero, reduce_epoch_totals, reduce_max
 from dscnn_kws.utils.training_artifacts import TrainingArtifactWriter
 
@@ -29,8 +26,8 @@ def _apply_packed_window_jitter(
     sample_rate: int,
 ) -> torch.Tensor:
     """Apply each record's bounded translation after packed PCM reaches its device."""
-    if waveform.ndim not in (3, 4) or waveform.shape[-2] != 1:
-        raise ValueError("packed jitter expects [batch, 1, samples] or [batch, 2, 1, samples]")
+    if waveform.ndim != 3 or waveform.shape[1] != 1:
+        raise ValueError("packed jitter expects waveform shape [batch, 1, samples]")
     jitter_samples = torch.round(jitter_ms.to(device=waveform.device, dtype=torch.float32) * sample_rate / 1000).to(torch.long)
     max_jitter = int(jitter_samples.max().item()) if jitter_samples.numel() else 0
     if max_jitter <= 0:
@@ -41,9 +38,7 @@ def _apply_packed_window_jitter(
     padded = F.pad(waveform, (max_jitter, max_jitter))
     positions = torch.arange(waveform.shape[-1], device=waveform.device).unsqueeze(0)
     positions = positions + max_jitter + random_offsets.unsqueeze(1)
-    index_shape = (waveform.shape[0],) + (1,) * (waveform.ndim - 2) + (waveform.shape[-1],)
-    gather_index = positions.reshape(index_shape).expand(waveform.shape)
-    return torch.gather(padded, dim=-1, index=gather_index)
+    return torch.gather(padded, dim=2, index=positions.unsqueeze(1))
 
 
 def _host_rss_bytes() -> int | None:
@@ -107,6 +102,25 @@ def epoch_metrics_from_totals(
     )
 
 
+class MarginAnchorLoss(nn.Module):
+    """Push negatives below neg_anchor, pull positives above pos_anchor, stop elsewhere."""
+
+    def __init__(self, neg_anchor: float, pos_anchor: float, pos_weight: float, neg_weight: float = 1.0):
+        super().__init__()
+        self.neg_anchor = float(neg_anchor)
+        self.pos_anchor = float(pos_anchor)
+        self.pos_weight = float(pos_weight)
+        self.neg_weight = float(neg_weight)
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        probs = torch.softmax(logits.float(), dim=1)
+        s = probs[:, 0]  # class 0 = positive
+        neg_term = self.neg_weight * torch.clamp(s - self.neg_anchor, min=0.0) ** 2
+        pos_term = self.pos_weight * torch.clamp(self.pos_anchor - s, min=0.0) ** 2
+        is_pos = labels == 0
+        return torch.where(is_pos, pos_term, neg_term).mean()
+
+
 class Trainer:
     def __init__(
         self,
@@ -120,7 +134,6 @@ class Trainer:
         device,
         save_dir: str,
         artifact_writer: TrainingArtifactWriter | None = None,
-        pair_train_loader=None,
     ):
         self.args = args
         self.model = model
@@ -129,19 +142,12 @@ class Trainer:
         self.train_loader = train_loader
         self.valid_loader = valid_loader
         self.test_loader = test_loader
-        self.pair_train_loader = pair_train_loader
         self.device = device
         self.save_dir = save_dir
         self.best_macro_f1 = float("-inf")
         self.best_negative_recall = float("-inf")
         self._best_checkpoint_path: str | None = None
         self._best_checkpoint_epoch: int | None = None
-        # Set when ``--temporal_init_from_global`` was used to warm-start an
-        # order-sensitive head from a legacy global-pooling checkpoint.  A
-        # migrated checkpoint is an initialization-only artifact: optimizer,
-        # scheduler, and epoch counters must not be restored because their
-        # parameter/state shapes belong to the old head.
-        self._resume_migrated = False
         self.early_stopping_bad_epochs = 0
         self.last_completed_epoch = 0
         self._last_train_elapsed_seconds = 0.0
@@ -156,154 +162,45 @@ class Trainer:
         self.history = list(self.artifact_writer.history) if self.artifact_writer is not None else []
         label_smoothing = float(getattr(self.args, "label_smoothing", 0.0))
         label_smoothing = min(max(label_smoothing, 0.0), 0.2)
-        self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-        self.pair_criterion: ConfirmationPairLoss | None = None
-        if bool(getattr(self.args, "pair_objective", False)):
-            self.pair_criterion = ConfirmationPairLoss(
-                runtime_threshold=float(getattr(self.args, "pair_runtime_threshold", 0.8)),
-                temperature=float(getattr(self.args, "pair_softmin_temperature", 0.25)),
-                positive_margin=float(getattr(self.args, "pair_positive_margin", 0.0)),
-                negative_margin=float(getattr(self.args, "pair_negative_margin", 0.0)),
-                frame_ce_weight=float(getattr(self.args, "pair_frame_ce_weight", 1.0)),
-                positive_weight=float(getattr(self.args, "pair_positive_weight", 1.0)),
-                positive_hinge_tail_fraction=float(
-                    getattr(self.args, "pair_positive_hinge_tail_fraction", 1.0)
-                ),
-                negative_weight=float(getattr(self.args, "pair_negative_weight", 1.0)),
-                negative_cvar_fraction=float(getattr(self.args, "pair_negative_cvar_fraction", 0.1)),
-                negative_source_cvar_fraction=float(
-                    getattr(self.args, "pair_negative_source_cvar_fraction", 1.0)
-                ),
-                negative_frame_target_probability=float(
-                    getattr(self.args, "pair_negative_frame_target_probability", 0.5)
-                ),
-                negative_frame_weight=float(getattr(self.args, "pair_negative_frame_weight", 0.0)),
-                tail_ranking_weight=float(getattr(self.args, "pair_tail_ranking_weight", 0.0)),
-                tail_ranking_margin=float(getattr(self.args, "pair_tail_ranking_margin", 0.0)),
-                positive_tail_fraction=float(getattr(self.args, "pair_positive_tail_fraction", 0.1)),
-                positive_class=0,
-                label_smoothing=label_smoothing,
+        self.daat_lambda = float(getattr(self.args, "daat_lambda", 0.0))
+        self.domain_criterion = nn.CrossEntropyLoss() if self.daat_lambda > 0.0 else None
+        if str(getattr(self.args, "loss_type", "ce")) == "margin":
+            self.criterion = MarginAnchorLoss(
+                neg_anchor=float(getattr(self.args, "margin_neg_anchor", 0.5)),
+                pos_anchor=float(getattr(self.args, "margin_pos_anchor", 0.9)),
+                pos_weight=float(getattr(self.args, "margin_pos_weight", 2.0)),
+                neg_weight=float(getattr(self.args, "margin_neg_weight", 1.0)),
             )
-        if (self.pair_criterion is None) != (self.pair_train_loader is None):
-            raise ValueError("pair_objective and pair_train_loader must be enabled together")
-        self.pair_objective_weight = float(getattr(self.args, "pair_objective_weight", 1.0))
-        if not math.isfinite(self.pair_objective_weight) or self.pair_objective_weight < 0.0:
-            raise ValueError("pair_objective_weight must be finite and non-negative")
-        pair_interval = getattr(self.args, "pair_interval", 1)
-        if isinstance(pair_interval, bool) or not isinstance(pair_interval, int) or pair_interval < 1:
-            raise ValueError("pair_interval must be a positive integer")
-        self.pair_interval = pair_interval
-
-    @staticmethod
-    def _set_loader_epoch(loader, epoch: int) -> None:
-        for sampler in (getattr(loader, "sampler", None), getattr(loader, "batch_sampler", None)):
-            if hasattr(sampler, "set_epoch"):
-                sampler.set_epoch(epoch)
-
-    @staticmethod
-    def _set_frozen_backbone_eval(
-        model: nn.Module,
-        *,
-        freeze_tail_batch_norm_stats: bool = False,
-    ) -> None:
-        """Keep frozen DSCNN state fixed while enabling its configured trainable tail."""
-        target = Trainer._model_for_state(model)
-        backbone = getattr(target, "backbone", None)
-        conv_layers = getattr(backbone, "conv_layers", None)
-        if backbone is None or conv_layers is None:
-            raise ValueError("freeze_backbone requires a DSCNN backbone with conv_layers and a classifier")
-        classifier_name = "temporal_fc" if getattr(backbone, "pooling", "global") == "temporal" else "final_fc"
-        classifier = getattr(backbone, classifier_name, None)
-        if classifier is None:
-            raise ValueError(f"freeze_backbone requires a DSCNN backbone.{classifier_name} classifier")
-
-        backbone.eval()
-        for layer in conv_layers:
-            if any(parameter.requires_grad for parameter in layer.parameters()):
-                layer.train()
-                if freeze_tail_batch_norm_stats:
-                    for module in layer.modules():
-                        if isinstance(module, nn.modules.batchnorm._BatchNorm):
-                            module.eval()
-        classifier.train()
-
-    def _next_pair_batch(self, pair_iterator):
-        if self.pair_criterion is None or self.pair_train_loader is None:
-            raise RuntimeError("pair batch requested without a configured pair loader")
-        try:
-            pair_batch = next(pair_iterator)
-        except StopIteration:
-            pair_iterator = iter(self.pair_train_loader)
-            try:
-                pair_batch = next(pair_iterator)
-            except StopIteration as error:
-                raise ValueError("confirmation pair loader is empty") from error
-        if not isinstance(pair_batch, Mapping):
-            raise ValueError("confirmation pair loader must return a mapping batch")
-        required_keys = {"waveform", "labels", "source_ids", "source_splits", "pair_roles", "pair_offsets"}
-        missing_keys = sorted(required_keys.difference(pair_batch))
-        if missing_keys:
-            raise ValueError(f"confirmation pair batch is missing required keys: {missing_keys}")
-        pair_waveform = pair_batch["waveform"].to(self.device, non_blocking=True)
-        pair_labels = pair_batch["labels"].to(self.device, non_blocking=True)
-        if pair_waveform.ndim != 4 or pair_waveform.shape[1] != 2:
-            raise ValueError(
-                "--pair_objective requires explicit adjacent waveform pairs with shape [batch, 2, channels, samples]"
+            print(
+                "[INFO] margin-anchor loss: neg_anchor="
+                f"{getattr(self.args, 'margin_neg_anchor', 0.5)} "
+                f"pos_anchor={getattr(self.args, 'margin_pos_anchor', 0.9)} "
+                f"pos_weight={getattr(self.args, 'margin_pos_weight', 2.0)}",
+                flush=True,
             )
-        if pair_labels.ndim != 1 or pair_labels.shape[0] != pair_waveform.shape[0]:
-            raise ValueError("labels must have shape [batch] and align with pair_logits")
-        source_splits = pair_batch["source_splits"]
-        if isinstance(source_splits, str):
-            source_splits = [source_splits]
+        positive_loss_weight = float(getattr(self.args, "positive_loss_weight", 1.0))
+        if str(getattr(self.args, "loss_type", "ce")) == "margin":
+            pass  # criterion already set to MarginAnchorLoss above
+        elif positive_loss_weight > 1.0:
+            class_weights = torch.tensor(
+                [positive_loss_weight, 1.0], device=self.device, dtype=torch.float32
+            )
+            self.criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+            print(
+                f"[INFO] weighted CE: positive_loss_weight={positive_loss_weight} (class 0 = positive)",
+                flush=True,
+            )
         else:
-            source_splits = list(source_splits)
-        if len(source_splits) != pair_waveform.shape[0] or any(split != "train" for split in source_splits):
-            raise ValueError("confirmation pair source_splits must contain 'train' for every pair")
-        pair_offsets = pair_batch["pair_offsets"]
-        if not isinstance(pair_offsets, torch.Tensor) or pair_offsets.shape != (pair_waveform.shape[0], 2):
-            raise ValueError("pair_offsets must have shape [batch, 2]")
-        expected_hop = round(
-            float(getattr(self.args, "sample_rate", 16_000))
-            * float(getattr(self.args, "pair_hop_ms", 96.0))
-            / 1000.0
-        )
-        if not bool((pair_offsets[:, 1] - pair_offsets[:, 0] == expected_hop).all()):
-            raise ValueError(f"pair_offsets must differ by exactly {expected_hop} samples")
-
-        def normalized_identifiers(identifiers, *, name: str):
-            if identifiers is None:
-                return None
-            if isinstance(identifiers, torch.Tensor):
-                if identifiers.ndim != 1 or identifiers.shape[0] != pair_waveform.shape[0]:
-                    raise ValueError(f"{name} must align with the full pair batch")
-                return identifiers
-            if isinstance(identifiers, (str, bytes)):
-                raise ValueError(f"{name} must align with the full pair batch")
-            values = list(identifiers)
-            if len(values) != pair_waveform.shape[0]:
-                raise ValueError(f"{name} must align with the full pair batch")
-            return values
-
-        source_ids = normalized_identifiers(pair_batch["source_ids"], name="negative_source_ids")
-        domain_ids = normalized_identifiers(pair_batch["pair_roles"], name="negative_domain_ids")
-        if domain_ids is not None and source_ids is None:
-            raise ValueError("negative_source_ids are required when negative_domain_ids are provided")
-        return pair_waveform, pair_labels, source_ids, domain_ids, pair_iterator
+            self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+            print("[INFO] plain CE loss", flush=True)
 
     def _run_epoch(self, loader, training: bool, epoch: int | None = None) -> EpochMetrics:
         if training:
             self.model.train()
-            if bool(getattr(self.args, "freeze_backbone", False)):
-                self._set_frozen_backbone_eval(
-                    self.model,
-                    freeze_tail_batch_norm_stats=bool(
-                        getattr(self.args, "freeze_tail_batch_norm_stats", False)
-                    ),
-                )
             if epoch is not None:
-                self._set_loader_epoch(loader, epoch)
-                if self.pair_train_loader is not None:
-                    self._set_loader_epoch(self.pair_train_loader, epoch)
+                for sampler in (getattr(loader, "sampler", None), getattr(loader, "batch_sampler", None)):
+                    if hasattr(sampler, "set_epoch"):
+                        sampler.set_epoch(epoch)
         else:
             self.model.eval()
         loss_sum = torch.zeros((), device=self.device, dtype=torch.float64)
@@ -317,25 +214,15 @@ class Trainer:
         log_interval = max(1, int(getattr(self.args, "log_interval", 50)))
         started_at = time.perf_counter()
         previous_step_finished_at = started_at
-        pair_iterator = iter(self.pair_train_loader) if training and self.pair_train_loader is not None else None
         with torch.set_grad_enabled(training):
             for step, batch in enumerate(iterator, start=1):
                 data_wait_seconds = max(time.perf_counter() - previous_step_finished_at, 0.0)
-                if isinstance(batch, Mapping):
-                    if "waveform" not in batch or "labels" not in batch:
-                        raise ValueError("mapping batches must contain waveform and labels")
-                    waveform = batch["waveform"]
-                    labels = batch["labels"]
-                    jitter_ms = batch.get("jitter_ms")
-                    roles = batch.get("roles")
-                elif isinstance(batch, (tuple, list)) and len(batch) in (2, 3, 4):
-                    waveform, labels = batch[:2]
-                    jitter_ms = batch[2] if len(batch) >= 3 else None
-                    roles = batch[3] if len(batch) == 4 else None
-                else:
-                    raise ValueError(
-                        "data loader must return waveform, labels, optional packed jitter metadata, and optional roles"
-                    )
+                if not isinstance(batch, (tuple, list)) or len(batch) not in (2, 3, 4, 5):
+                    raise ValueError("data loader must return waveform, labels, optional packed jitter metadata, optional roles, and optional domains")
+                waveform, labels = batch[:2]
+                jitter_ms = batch[2] if len(batch) >= 3 else None
+                roles = batch[3] if len(batch) >= 4 else None
+                domains = batch[4] if len(batch) == 5 else None
                 if training and roles is not None:
                     for role in roles:
                         role_name = str(role)
@@ -352,39 +239,29 @@ class Trainer:
                             jitter_ms,
                             sample_rate=int(getattr(self.args, "sample_rate", 16_000)),
                         )
+                if training:
+                    gain_db = float(getattr(self.args, "random_gain_db", 0.0))
+                    if gain_db > 0.0:
+                        g = torch.empty(waveform.shape[0], 1, device=waveform.device, dtype=waveform.dtype)
+                        if waveform.dim() == 3:
+                            g = g.unsqueeze(-1)
+                        g.uniform_(-gain_db, gain_db)
+                        waveform = waveform * (10.0 ** (g / 20.0))
                 h2d_seconds = max(time.perf_counter() - h2d_started_at, 0.0)
                 compute_started_at = time.perf_counter()
                 if training:
                     self.optimizer.zero_grad(set_to_none=True)
-                pair_inputs = None
-                if training and pair_iterator is not None and step % self.pair_interval == 0:
-                    pair_waveform, pair_labels, pair_source_ids, pair_domain_ids, pair_iterator = (
-                        self._next_pair_batch(pair_iterator)
-                    )
-                    pair_batch_size, pair_frames, pair_channels, pair_samples = pair_waveform.shape
-                    flat_pair_waveform = pair_waveform.reshape(
-                        pair_batch_size * pair_frames, pair_channels, pair_samples
-                    )
-                    pair_inputs = (pair_labels, pair_source_ids, pair_domain_ids, pair_batch_size, pair_frames)
-                    model_waveform = torch.cat((waveform, flat_pair_waveform), dim=0)
+                out = self.model(waveform)
+                dom_logits = None
+                if isinstance(out, tuple):
+                    logits, dom_logits = out
                 else:
-                    model_waveform = waveform
-                joint_logits_fp32 = self.model(model_waveform).float()
-                base_batch_size = waveform.shape[0]
-                logits_fp32 = joint_logits_fp32[:base_batch_size]
+                    logits = out
+                logits_fp32 = logits.float()
                 loss = self.criterion(logits_fp32, labels)
-                if pair_inputs is not None:
-                    pair_labels, pair_source_ids, pair_domain_ids, pair_batch_size, pair_frames = pair_inputs
-                    pair_logits = joint_logits_fp32[base_batch_size:].reshape(pair_batch_size, pair_frames, -1)
-                    pair_loss = self.pair_criterion(
-                        pair_logits,
-                        pair_labels,
-                        negative_source_ids=pair_source_ids,
-                        negative_domain_ids=pair_domain_ids,
-                    )
-                    if not bool(torch.isfinite(pair_logits).all()) or not bool(torch.isfinite(pair_loss)):
-                        raise FloatingPointError("Non-finite logits or loss during confirmation-pair training")
-                    loss = loss + self.pair_objective_weight * pair_loss
+                if training and dom_logits is not None and domains is not None:
+                    dom_labels = domains.to(self.device, non_blocking=True).long()
+                    loss = loss + self.daat_lambda * self.domain_criterion(dom_logits.float(), dom_labels)
                 if training:
                     if not bool(torch.isfinite(logits_fp32).all()) or not bool(torch.isfinite(loss)):
                         raise FloatingPointError("Non-finite logits or loss during training")
@@ -501,135 +378,6 @@ class Trainer:
             if os.path.exists(temporary_path):
                 os.unlink(temporary_path)
 
-    @staticmethod
-    def _sha256_file(path: str) -> str:
-        digest = hashlib.sha256()
-        with open(path, "rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(block)
-        return digest.hexdigest()
-
-    def _pair_provenance(self) -> dict | None:
-        if self.pair_criterion is None:
-            return None
-        pair_dataset = getattr(self.pair_train_loader, "dataset", None)
-        manifest_value = getattr(pair_dataset, "manifest_path", None) or getattr(
-            self.args, "pair_train_manifest", ""
-        )
-        manifest_path = os.path.abspath(str(manifest_value))
-        if not os.path.isfile(manifest_path):
-            raise FileNotFoundError(f"Pair manifest disappeared before checkpointing: {manifest_path}")
-        sample_rate = int(getattr(self.args, "sample_rate", 16_000))
-        hop_ms = float(getattr(self.args, "pair_hop_ms", 96.0))
-        effective_pair_batch = getattr(self.pair_train_loader, "batch_size", None)
-        if effective_pair_batch is None:
-            configured_pair_batch = getattr(self.args, "pair_batch", None)
-            effective_pair_batch = (
-                int(configured_pair_batch)
-                if configured_pair_batch is not None
-                else int(getattr(self.args, "batch", 256))
-            )
-        positive_pairs_per_batch = int(getattr(self.args, "pair_positive_per_batch", 0))
-        tail_ranking_weight = float(getattr(self.args, "pair_tail_ranking_weight", 0.0))
-        return {
-            "manifest_path": manifest_path,
-            "manifest_sha256": self._sha256_file(manifest_path),
-            "sample_rate": sample_rate,
-            "hop_ms": hop_ms,
-            "hop_samples": round(sample_rate * hop_ms / 1000.0),
-            "pair_batch_size": int(effective_pair_batch),
-            **(
-                {
-                    "positive_pairs_per_rank_batch": positive_pairs_per_batch,
-                    "pair_batch_sampling": "distributed_class_role_source_stratified_v1",
-                }
-                if positive_pairs_per_batch > 0
-                else {}
-            ),
-            "seed": int(getattr(self.args, "seed", 42)),
-            "label_smoothing": float(getattr(self.args, "label_smoothing", 0.0)),
-            "runtime_threshold": float(getattr(self.args, "pair_runtime_threshold", 0.8)),
-            "softmin_temperature": float(getattr(self.args, "pair_softmin_temperature", 0.25)),
-            "positive_margin_logit": float(getattr(self.args, "pair_positive_margin", 0.0)),
-            "negative_margin_logit": float(getattr(self.args, "pair_negative_margin", 0.0)),
-            "frame_ce_weight": float(getattr(self.args, "pair_frame_ce_weight", 1.0)),
-            "positive_weight": float(getattr(self.args, "pair_positive_weight", 1.0)),
-            "positive_hinge_tail_fraction": float(
-                getattr(self.args, "pair_positive_hinge_tail_fraction", 1.0)
-            ),
-            "negative_weight": float(getattr(self.args, "pair_negative_weight", 1.0)),
-            "negative_cvar_fraction": float(getattr(self.args, "pair_negative_cvar_fraction", 0.1)),
-            "negative_source_cvar_fraction": float(
-                getattr(self.args, "pair_negative_source_cvar_fraction", 1.0)
-            ),
-            "negative_frame_target_probability": float(
-                getattr(self.args, "pair_negative_frame_target_probability", 0.5)
-            ),
-            "negative_frame_weight": float(getattr(self.args, "pair_negative_frame_weight", 0.0)),
-            **(
-                {
-                    "tail_ranking_weight": tail_ranking_weight,
-                    "tail_ranking_margin_logit": float(
-                        getattr(self.args, "pair_tail_ranking_margin", 0.0)
-                    ),
-                    "positive_tail_fraction": float(
-                        getattr(self.args, "pair_positive_tail_fraction", 0.1)
-                    ),
-                }
-                if tail_ranking_weight > 0.0
-                else {}
-            ),
-            "negative_balance": "domain_then_source_cvar_v1",
-            "objective_weight": self.pair_objective_weight,
-            "interval": self.pair_interval,
-        }
-
-    @staticmethod
-    def _pair_provenance_without_path(value):
-        if not isinstance(value, dict):
-            return value
-        comparable = {key: item for key, item in value.items() if key != "manifest_path"}
-        # Checkpoints created before positive hinge CVaR used the exact
-        # equivalent of a full-tail fraction. Preserve that resume path while
-        # still rejecting any non-default objective change.
-        comparable.setdefault("positive_hinge_tail_fraction", 1.0)
-        return comparable
-
-    def _validate_pair_resume_provenance(self, payload: dict) -> None:
-        provenance = payload.get("provenance")
-        saved_has_pair_field = isinstance(provenance, dict) and "confirmation_pair" in provenance
-        saved_pair = provenance.get("confirmation_pair") if saved_has_pair_field else None
-        current_pair = self._pair_provenance()
-        if not saved_has_pair_field:
-            if current_pair is not None:
-                raise ValueError(
-                    "Cannot resume pair-objective training from a full checkpoint without confirmation-pair provenance"
-                )
-            return
-        if saved_pair is None and current_pair is None:
-            return
-        if not isinstance(saved_pair, dict) or current_pair is None:
-            raise ValueError("Checkpoint and current run disagree on whether confirmation-pair training is enabled")
-
-        # A manifest may be relocated, but its content and every objective
-        # parameter that changes gradients must remain identical on resume.
-        current_comparable = self._pair_provenance_without_path(current_pair)
-        saved_comparable = self._pair_provenance_without_path(saved_pair)
-        compared_keys = tuple(current_comparable)
-        missing_keys = [key for key in compared_keys if key not in saved_comparable]
-        if missing_keys:
-            raise ValueError(f"Checkpoint confirmation-pair provenance is missing keys: {missing_keys}")
-        mismatches = [
-            key
-            for key in compared_keys
-            if saved_comparable.get(key) != current_comparable.get(key)
-        ]
-        if mismatches:
-            raise ValueError(
-                "Checkpoint confirmation-pair provenance does not match the current run: "
-                + ", ".join(mismatches)
-            )
-
     def _checkpoint_state(self, epoch: int) -> dict:
         sampler_epoch = int(epoch)
         for sampler in (getattr(self.train_loader, "sampler", None), getattr(self.train_loader, "batch_sampler", None)):
@@ -651,16 +399,8 @@ class Trainer:
             "provenance": {
                 "dashboard_reco_metric": "one_minus_validation_macro_f1",
                 "run_variant": str(getattr(self.args, "run_name", "unspecified")),
-                "confirmation_pair": self._pair_provenance(),
             },
         }
-
-    def _write_candidate_snapshot(self, epoch: int) -> None:
-        cadence = int(getattr(self.args, "candidate_checkpoint_every", 0))
-        if cadence > 0 and epoch % cadence == 0:
-            path = os.path.join(self.save_dir, "candidates", f"epoch-{epoch:04d}.pt")
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            self._atomic_torch_save({"model": self._model_for_state(self.model).state_dict()}, path)
 
     @staticmethod
     def _merge_history(existing: list[dict], restored: list[dict]) -> list[dict]:
@@ -672,79 +412,6 @@ class Trainer:
             rows[epoch] = {**rows.get(epoch, {}), **row}
         return [rows[epoch] for epoch in sorted(rows)]
 
-    @staticmethod
-    def _migrate_global_to_temporal_state_dict(model: nn.Module, source_state: dict) -> dict:
-        """Expand a legacy global DSCNN classifier into a temporal head.
-
-        Global pooling computes ``W * mean(h_i) + b``.  A temporal head with
-        ``B`` bins sees ``[h_1, ..., h_B]``; repeating ``W / B`` for each bin
-        therefore gives an exactly equivalent starting function before the
-        first gradient update.  All convolution/front-end weights are copied
-        unchanged.  The helper deliberately requires a temporal DSCNN and
-        matching classifier tensors so malformed checkpoints fail loudly.
-        """
-
-        target = Trainer._model_for_state(model)
-        backbone = getattr(target, "backbone", target)
-        if getattr(backbone, "pooling", None) != "temporal" or not hasattr(backbone, "temporal_fc"):
-            raise ValueError("--temporal_init_from_global requires a temporal DSCNN backbone")
-        if not isinstance(source_state, dict):
-            raise ValueError("Checkpoint model state must be a dictionary")
-
-        # A few legacy DDP runs persisted ``module.*`` keys directly.  Keep
-        # migration tolerant of that format while still loading the target
-        # model strictly (without leaving prefixed unexpected keys behind).
-        if source_state and all(str(key).startswith("module.") for key in source_state):
-            source_state = {str(key)[len("module.") :]: value for key, value in source_state.items()}
-
-        current_state = target.state_dict()
-        migrated = dict(source_state)
-        temporal_bins = int(backbone.temporal_bins)
-        copied_temporal = False
-        for temporal_key, target_tensor in current_state.items():
-            if "temporal_fc." not in temporal_key:
-                continue
-            global_key = temporal_key.replace("temporal_fc", "final_fc", 1)
-            source_tensor = source_state.get(global_key)
-            if source_tensor is None:
-                raise ValueError(
-                    "Legacy global checkpoint is missing the classifier tensor "
-                    f"{global_key!r} required for temporal migration"
-                )
-            if not isinstance(source_tensor, torch.Tensor):
-                raise ValueError(f"Checkpoint tensor {global_key!r} is not a torch.Tensor")
-            if temporal_key.endswith("weight"):
-                if source_tensor.ndim != 2 or target_tensor.ndim != 2:
-                    raise ValueError("final_fc/temporal_fc weights must be rank-2 tensors")
-                expected_shape = (source_tensor.shape[0], source_tensor.shape[1] * temporal_bins)
-                if tuple(target_tensor.shape) != tuple(expected_shape):
-                    raise ValueError(
-                        f"Temporal classifier shape mismatch: target={tuple(target_tensor.shape)}, "
-                        f"expected={expected_shape}"
-                    )
-                # ``flatten(1)`` on [batch, channels, bins] stores each
-                # channel's bins contiguously: [c0b0..c0bB, c1b0..].  Tile
-                # along that innermost bin axis, rather than repeating the
-                # whole classifier row, to preserve the global-pool function.
-                migrated[temporal_key] = (
-                    source_tensor.unsqueeze(-1)
-                    .expand(-1, -1, temporal_bins)
-                    .reshape(source_tensor.shape[0], -1)
-                    .div(float(temporal_bins))
-                )
-            else:
-                if tuple(target_tensor.shape) != tuple(source_tensor.shape):
-                    raise ValueError(
-                        f"Temporal classifier bias shape mismatch: target={tuple(target_tensor.shape)}, "
-                        f"source={tuple(source_tensor.shape)}"
-                    )
-                migrated[temporal_key] = source_tensor.clone()
-            copied_temporal = True
-
-        if not copied_temporal:
-            raise ValueError("Legacy checkpoint does not contain temporal classifier tensors to migrate")
-        return migrated
-
     def _restore_state_dict(self, payload) -> bool:
         model_state = None
         if isinstance(payload, dict):
@@ -753,21 +420,10 @@ class Trainer:
             model_state = payload
         if not isinstance(model_state, dict):
             raise ValueError("Checkpoint does not contain a model state dictionary")
-        model_for_state = self._model_for_state(self.model)
-        try:
-            model_for_state.load_state_dict(model_state)
-        except RuntimeError:
-            if not bool(getattr(self.args, "temporal_init_from_global", False)):
-                raise
-            migrated_state = self._migrate_global_to_temporal_state_dict(model_for_state, model_state)
-            model_for_state.load_state_dict(migrated_state, strict=True)
-            self._resume_migrated = True
-            warnings.warn(
-                "Initialized temporal DSCNN head from a legacy global-pooling checkpoint; "
-                "optimizer, scheduler, and epoch state will be restarted.",
-                RuntimeWarning,
-            )
-            return False
+        if int(getattr(self.args, "domain_classes", 0) or 0) > 0:
+            self._model_for_state(self.model).load_state_dict(model_state, strict=False)
+        else:
+            self._model_for_state(self.model).load_state_dict(model_state)
         return (
             isinstance(payload, dict)
             and "epoch" in payload
@@ -785,9 +441,6 @@ class Trainer:
         payload = self._load_torch(resume_path, self.device)
         full_checkpoint = self._restore_state_dict(payload)
         if not full_checkpoint:
-            if self._resume_migrated:
-                barrier()
-                return 1
             warnings.warn(
                 "Loaded a legacy model-only checkpoint; optimizer, scheduler, and epoch state are unavailable, "
                 "so training restarts at epoch 1.",
@@ -795,7 +448,6 @@ class Trainer:
             )
             barrier()
             return 1
-        self._validate_pair_resume_provenance(payload)
         if payload.get("optimizer") is not None:
             self.optimizer.load_state_dict(payload["optimizer"])
         if self.scheduler is not None and payload.get("scheduler") is not None:
@@ -848,11 +500,6 @@ class Trainer:
                 and resume_provenance.get("run_variant") != best_provenance.get("run_variant")
             ):
                 return None
-            if isinstance(resume_provenance, dict) and isinstance(best_provenance, dict):
-                resume_pair = self._pair_provenance_without_path(resume_provenance.get("confirmation_pair"))
-                best_pair = self._pair_provenance_without_path(best_provenance.get("confirmation_pair"))
-                if resume_pair != best_pair:
-                    return None
             format_version = int(resume_payload.get("format_version", 0))
             if format_version >= 4:
                 expected_epoch = resume_payload.get("best_checkpoint_epoch")
@@ -1007,7 +654,6 @@ class Trainer:
                 if is_best:
                     self._atomic_torch_save(checkpoint_state, best_path)
                 self._atomic_torch_save(checkpoint_state, last_path)
-                self._write_candidate_snapshot(epoch)
             barrier()
 
             if is_rank_zero():

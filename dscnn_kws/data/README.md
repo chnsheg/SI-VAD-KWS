@@ -403,49 +403,7 @@ python dscnn_kws/eval_fah_frr.py \
   --target_fah 0.1 0.5 1.0
 ```
 
-## 10. 连续两帧确认训练 manifest
-
-`--pair_objective` 只接受独立的 `--pair_train_manifest` JSONL。每行必须显式指向同一音频源中的一段连续区间，不能把旧单窗 manifest 或 shuffled batch 中的两条记录拼成 pair。
-
-16 kHz、1 秒窗口、96 ms hop 的正例行示例：
-
-```json
-{"format":"kws_confirmation_pair_v1","audio_filepath":"audio/session_7.wav","command":"positive","role":"captured_positive","source_split":"train","source_id":"mic243/session_7","sample_rate":16000,"span_start_sample":32000,"span_num_samples":17536,"window_samples":16000,"hop_samples":1536,"active_start_sample":35000,"active_end_sample":43800}
-```
-
-负例使用同一 schema，但必须省略 `active_start_sample` 和 `active_end_sample`：
-
-```json
-{"format":"kws_confirmation_pair_v1","audio_filepath":"audio/bus_1.wav","command":"negative","role":"tau_noise_negative","source_split":"train","source_id":"tau/bus_1","sample_rate":16000,"span_start_sample":96000,"span_num_samples":17536,"window_samples":16000,"hop_samples":1536}
-```
-
-字段约束：
-
-- `span_start_sample`、`active_start_sample` 和 `active_end_sample` 都是源文件内的绝对 sample offset。
-- `span_num_samples` 必须恰好等于 `window_samples + hop_samples`。loader 从 `span_start_sample` 和 `span_start_sample + hop_samples` 切出两帧，并返回这两个绝对 offset。
-- `source_split` 记录源数据的固定划分；`source_id` 必须在该划分内稳定标识同一条原始录音，供 source-balanced CVaR 使用，不能用随机 record ID 代替；`role` 保留 positive、captured、false-wake 或 TAU 等训练来源类别。
-- 正例 active span 必须完整位于两帧公共重叠区 `[span_start_sample + hop_samples, span_start_sample + window_samples)`，确保两帧都包含完整唤醒词。
-- 多声道音频固定使用 channel 0。pair loader 禁止在线重采样、在线噪声增强和独立窗口 jitter；增强后的连续 span 应离线生成并写入 manifest。
-- `--pair_negative_cvar_fraction` 在每个 source 内选择最坏位置；`--pair_negative_source_cvar_fraction` 再在每个 domain 内选择最坏 source。后者默认 `1.0`，只有显式调低时才会把梯度集中到少数最高风险 source。
-- 当 pair manifest 严重偏向负例时，应将 `--pair_frame_ce_weight` 设为 `0`，依靠平衡的基础 mixture CE 保持分类能力，避免辅助 CE 无差别下压所有 wake 分数。
-
-训练入口示例：
-
-```bash
-python -m dscnn_kws.train \
-  --pair_objective \
-  --pair_train_manifest /data/kws/pairs/train.jsonl \
-  --pair_hop_ms 96 \
-  --sample_rate 16000 \
-  --offline_augmented_dataset \
-  --no-noise_aug
-```
-
-validation/test 仍使用原单窗 manifest，以便旧指标与历史 checkpoint 保持可比。
-
-当前 DDP 下的 CVaR 是 rank-local surrogate；构造 manifest 和 batch 时应让每个 noise source 在单个 batch 内提供多个连续 pair，并避免把同一 source 的记录切散到过多 rank。部署 gate 仍须使用独立长流音频计算全局 FAH，不能用训练 CVaR 代替。
-
-## 11. Sweep 脚本和 Mobvoi 数据集
+## 10. Sweep 脚本和 Mobvoi 数据集
 
 干净 ACC/F1 架构搜索脚本 `dscnn_kws/sweep_dscnn_acc.py` 使用 hardneg 数据集，并且会显式传入：
 
@@ -478,9 +436,9 @@ python dscnn_kws/data/prepare_mobvoi_hardneg_manifests.py
 
 已经成功生成推荐的 hardneg 数据集。
 
-## 12. 常见问题
+## 11. 常见问题
 
-### 12.1 找不到 wav
+### 11.1 找不到 wav
 
 报错通常类似：
 
@@ -494,7 +452,7 @@ Failed to resolve audio path from manifest
 - manifest 中的 `audio_filepath` 是否仍然能相对于数据集目录找到原始 wav。
 - 是否移动了生成后的 manifest 目录，但没有同时保持它与原始 wav 目录的相对关系。
 
-### 12.2 采样率不匹配
+### 11.2 采样率不匹配
 
 报错通常类似：
 
@@ -508,7 +466,7 @@ Sample-rate mismatch: ..., got 16000, expected 8000
 - 如果想统一到某个采样率，加 `--allow_online_resample`。
 - 如果只是临时跳过启动前抽样检查，可以加 `--no-verify_sample_rate`，但加载时仍可能因 `--strict_sample_rate` 报错。
 
-### 12.3 clean baseline 结果突然变了
+### 11.3 clean baseline 结果突然变了
 
 `train.py` 默认 `--noise_aug=True`。干净实验应显式加：
 
@@ -516,7 +474,7 @@ Sample-rate mismatch: ..., got 16000, expected 8000
 --no-noise_aug --no-eval_noise_aug
 ```
 
-### 12.4 ACC/F1 数据集和 FAH/FRR 数据集怎么选
+### 11.4 ACC/F1 数据集和 FAH/FRR 数据集怎么选
 
 简单规则：
 
@@ -527,7 +485,7 @@ Sample-rate mismatch: ..., got 16000, expected 8000
 | 不使用另一个唤醒词作为 hard negative | `mobvoi_<keyword>_binary` 或 `mobvoi_<keyword>_binary_fah` |
 | 两个唤醒词合并成一个 positive 类 | `mobvoi_hotwords_binary` |
 
-## 13. 推荐最小流程
+## 12. 推荐最小流程
 
 从原始 Mobvoi 数据到一次 clean baseline 的最小流程：
 

@@ -30,6 +30,7 @@ class MiningCandidate:
     duration_seconds: float
     positive_score: float
     selection_reason: str = ""
+    source_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -78,22 +79,6 @@ SCORING_MODEL_KEYS = (
     "log_input_clamp_min",
 )
 
-# Architecture-head options were added after the original checkpoint
-# contract.  Keep them optional so historical global-pool checkpoints remain
-# fully readable while temporal-head runs can be mined/evaluated faithfully.
-OPTIONAL_SCORING_MODEL_DEFAULTS = {
-    "model": "dscnn",
-    "pooling": "global",
-    "temporal_bins": 4,
-    "mfcc_scale": "torchaudio_db",
-    "mfcc_c0_cmn": False,
-    "tcn_channels": 68,
-    "tcn_blocks": 4,
-    "tcn_kernel_size": 3,
-    "tcn_dilations": [1, 1, 2, 2],
-    "tcn_temporal_bins": 8,
-}
-
 
 def _parse_argv_value(value: str) -> Any:
     if value in {"True", "False", "None"}:
@@ -134,9 +119,19 @@ def scoring_namespace(values: Mapping[str, Any], checkpoint_path: Path | str) ->
     if missing:
         raise ValueError(f"Checkpoint run configuration is missing model arguments: {', '.join(missing)}")
     namespace_values = {key: values[key] for key in SCORING_MODEL_KEYS}
-    for key, default in OPTIONAL_SCORING_MODEL_DEFAULTS.items():
-        namespace_values[key] = values.get(key, default)
     namespace_values["ckpt"] = str(checkpoint_path)
+    # PCMN frontend args: optional for backwards compatibility with pre-v3.0 checkpoints
+    namespace_values.setdefault("frontend_delta", values.get("frontend_delta", False))
+    namespace_values.setdefault("pcen_t", values.get("pcen_t"))
+    namespace_values.setdefault("pcen_gain", values.get("pcen_gain", 1.0))
+    namespace_values.setdefault("pcen_power", values.get("pcen_power", 0.5))
+    namespace_values.setdefault("pcen_eps", values.get("pcen_eps", 1e-6))
+    namespace_values.setdefault("pcen_stats", values.get("pcen_stats"))
+    namespace_values.setdefault("pcen_blend_w", values.get("pcen_blend_w", 0.0))
+    namespace_values.setdefault("pcmn_alpha", values.get("pcmn_alpha"))
+    namespace_values.setdefault("pcmn_delta", values.get("pcmn_delta", 1.0))
+    namespace_values.setdefault("pcmn_num_drop", values.get("pcmn_num_drop", 0))
+    namespace_values.setdefault("pcmn_blend_w", values.get("pcmn_blend_w", 0.0))
     return argparse.Namespace(**namespace_values)
 
 
@@ -168,6 +163,149 @@ def validate_false_wake_sources(rows: Sequence[Mapping[str, object]]) -> None:
         value = row.get("audio_path", row.get("audio_filepath"))
         if not isinstance(value, str) or not value.strip():
             raise ValueError("False-wake source must include an audio path")
+
+
+def dense_false_wake_candidates(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    hop_samples: int = 1536,
+    sample_rate: int = 16000,
+) -> list[MiningCandidate]:
+    """Enumerate only complete V3 one-second windows at the deployed hop.
+
+    Unlike the legacy miner, this intentionally does not call
+    :func:`_canonical_window`: V3 must never score or materialize a padded tail
+    because deployment receives only complete streaming windows.
+    """
+    if hop_samples <= 0 or sample_rate <= 0:
+        raise ValueError("hop_samples and sample_rate must be positive")
+    candidates: list[MiningCandidate] = []
+    for row in rows:
+        if row.get("source_split") != "train":
+            raise ValueError("Dense V3 false-wake candidates must be train-only")
+        source_role = str(row.get("source_role", "false_wake"))
+        if source_role != "false_wake":
+            raise ValueError(f"Dense V3 candidate has unsupported source role: {source_role}")
+        path_value = row.get("audio_path", row.get("audio_filepath", row.get("path")))
+        if not isinstance(path_value, str) or not path_value.strip():
+            raise ValueError("Dense V3 false-wake candidate has no audio path")
+        source_sha256 = row.get("source_sha256", row.get("parent_source_sha256"))
+        if not isinstance(source_sha256, str) or not source_sha256.strip():
+            raise ValueError("Dense V3 false-wake candidate has no source_sha256")
+        frames = row.get("frames")
+        if isinstance(frames, bool) or not isinstance(frames, int) or frames < 0:
+            raise ValueError("Dense V3 false-wake candidate has invalid frames")
+        for start_sample in range(0, frames - sample_rate + 1, hop_samples):
+            candidates.append(
+                MiningCandidate(
+                    audio_path=str(Path(path_value).expanduser().resolve()),
+                    source_split="train",
+                    source_role="false_wake",
+                    start_sample=start_sample,
+                    duration_seconds=1.0,
+                    positive_score=float("nan"),
+                    source_sha256=source_sha256,
+                )
+            )
+    return candidates
+
+
+def rank_false_wake_candidates(
+    candidates: Sequence[MiningCandidate],
+    *,
+    previous_scores: Mapping[tuple[str, int], float],
+    hop_samples: int = 1536,
+) -> list[MiningCandidate]:
+    """Rank dense V3 windows with adjacent-frame continuity evidence."""
+    if hop_samples <= 0:
+        raise ValueError("hop_samples must be positive")
+    ranked: list[MiningCandidate] = []
+    for candidate in candidates:
+        if candidate.source_split != "train" or candidate.source_role != "false_wake":
+            raise ValueError("Only train false-wake candidates may be V3-ranked")
+        source_sha256 = candidate.source_sha256
+        if not source_sha256:
+            raise ValueError("V3-ranked candidate has no source_sha256")
+        own_score = previous_scores.get((source_sha256, candidate.start_sample), candidate.positive_score)
+        if not math.isfinite(own_score):
+            raise ValueError("V3 false-wake candidate score must be finite")
+        adjacent = [
+            previous_scores[(source_sha256, neighbour)]
+            for neighbour in (candidate.start_sample - hop_samples, candidate.start_sample + hop_samples)
+            if (source_sha256, neighbour) in previous_scores
+        ]
+        if any(not math.isfinite(value) for value in adjacent):
+            raise ValueError("V3 adjacent false-wake score must be finite")
+        continuity = 0.25 * min(adjacent) if adjacent else 0.0
+        ranked.append(
+            replace(
+                candidate,
+                positive_score=float(own_score + continuity),
+                selection_reason="v3_dense_continuity_score",
+            )
+        )
+    return sorted(
+        ranked,
+        key=lambda item: (-item.positive_score, item.source_sha256, item.start_sample),
+    )
+
+
+def select_source_balanced(
+    candidates: Sequence[MiningCandidate],
+    *,
+    target_count: int,
+    seed: int,
+) -> list[MiningCandidate]:
+    """Select ranked candidates round-robin across train source hashes.
+
+    The input ordering establishes per-source priority (normally the dense
+    continuity ranking).  A source cannot contribute twice in one selection
+    round, preventing a long recording from displacing short recordings.
+    """
+    if target_count <= 0:
+        raise ValueError("target_count must be positive")
+    by_source: dict[str, list[MiningCandidate]] = {}
+    for candidate in candidates:
+        if candidate.source_split != "train":
+            raise ValueError("Source-balanced V3 selection must be train-only")
+        if not candidate.source_sha256:
+            raise ValueError("Source-balanced V3 candidate has no source_sha256")
+        by_source.setdefault(candidate.source_sha256, []).append(candidate)
+    if not by_source:
+        raise ValueError("Source-balanced V3 selection has no candidates")
+
+    source_order = sorted(by_source)
+    random = np.random.default_rng(seed)
+    random.shuffle(source_order)
+    offsets = {source_sha256: 0 for source_sha256 in source_order}
+    selected: list[MiningCandidate] = []
+    while len(selected) < target_count:
+        selected_this_round = 0
+        for source_sha256 in source_order:
+            offset = offsets[source_sha256]
+            source_candidates = by_source[source_sha256]
+            if offset >= len(source_candidates):
+                continue
+            selected.append(
+                replace(
+                    source_candidates[offset],
+                    selection_reason=(
+                        source_candidates[offset].selection_reason
+                        or "v3_source_balanced"
+                    ),
+                )
+            )
+            offsets[source_sha256] = offset + 1
+            selected_this_round += 1
+            if len(selected) == target_count:
+                break
+        if selected_this_round == 0:
+            break
+    if len(selected) < target_count:
+        raise ValueError(
+            f"Source-balanced V3 selection has {len(selected)} candidates, needs {target_count}"
+        )
+    return selected
 
 
 def select_hard_negatives(candidates: Sequence[MiningCandidate]) -> list[MiningCandidate]:
@@ -208,11 +346,7 @@ def _canonical_window(candidate: MiningCandidate, sample_rate: int) -> np.ndarra
         start_sample = round(candidate.start_sample * sample_rate / source_rate)
     else:
         start_sample = candidate.start_sample
-    # Match the production streaming-input contract: resample each channel
-    # independently, then retain channel 0.  Averaging channels here can
-    # introduce phase cancellation and makes mined windows differ from what
-    # the deployed evaluator/model actually sees.
-    waveform = waveform.narrow(0, 0, 1)
+    waveform = waveform.mean(dim=0, keepdim=True)
     window_samples = round(candidate.duration_seconds * sample_rate)
     if window_samples <= 0:
         raise ValueError("Hard-negative duration must be positive")

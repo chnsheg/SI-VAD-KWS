@@ -45,14 +45,7 @@ def _atomic_write_json(path: Path, value: object) -> None:
 
 
 def canonical_pcm16(waveform: torch.Tensor, *, sample_rate: int) -> torch.Tensor:
-    """Convert a waveform to one fixed PCM16 second using channel 0.
-
-    Packed records are already at ``sample_rate`` (there is no source-rate
-    argument here), so this function performs only shape/length canonicalizing.
-    For multi-channel input we intentionally retain channel 0, matching the
-    streaming/evaluation audio contract; averaging channels can create phase
-    cancellation and train/deployment skew.
-    """
+    """Convert an arbitrary mono/stereo float waveform to one fixed PCM16 second."""
     if sample_rate <= 0:
         raise ValueError("sample_rate must be positive")
     value = waveform.detach().to(device="cpu", dtype=torch.float32)
@@ -63,7 +56,7 @@ def canonical_pcm16(waveform: torch.Tensor, *, sample_rate: int) -> torch.Tensor
     if not bool(torch.isfinite(value).all()):
         raise ValueError("waveform must contain only finite values")
     if value.shape[0] > 1:
-        value = value.narrow(0, 0, 1)
+        value = value.mean(dim=0, keepdim=True)
     if value.shape[1] < sample_rate:
         value = torch.nn.functional.pad(value, (0, sample_rate - value.shape[1]))
     elif value.shape[1] > sample_rate:
@@ -223,9 +216,21 @@ class PackedPcmDataset(Dataset):
         self._jitter_handle: BinaryIO | None = None
         self._jitter_map: mmap.mmap | None = None
         self._open_shards: OrderedDict[int, tuple[BinaryIO, mmap.mmap]] = OrderedDict()
+        domains_path = self._root / "domains.u8"
+        self._domains = None
+        if domains_path.exists():
+            raw_domains = domains_path.read_bytes()
+            if len(raw_domains) != self.record_count:
+                raise ValueError("packed domain index has an unexpected size")
+            self._domains = raw_domains
 
     def __len__(self) -> int:
         return self.record_count
+
+    def domain_at(self, index: int) -> int:
+        if self._domains is None:
+            return 12  # train-domain default for packs without a domain sidecar
+        return self._domains[int(index)]
 
     def __getstate__(self):
         state = self.__dict__.copy()

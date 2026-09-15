@@ -6,14 +6,14 @@
 
 ## 前提与输入契约
 
-- 在本项目根目录运行脚本；Python 环境必须可导入 `torch`、`onnx`、`onnxruntime`，并且 PyTorch 必须提供 `fbgemm` 量化后端。
+- 在项目根目录 `upstream/repo` 运行脚本；Python 环境必须可导入 `torch`、`onnx`、`onnxruntime`，并且 PyTorch 必须提供 `fbgemm` 量化后端。
 - `--checkpoint` 必须是 v6.1 转换后的 INT8 backbone checkpoint，且包含可严格加载的 `state_dict`；不能传入 QAT prepared checkpoint 或浮点 checkpoint。
 - `--spec` 必须是与 checkpoint 配套的严格整数 MFCC JSON 规范。二者作为一个不可拆分的版本对待，报告和 ONNX 元数据会分别记录 SHA-256。
 - 模型 I/O 固定为 `waveform: float32[1, 16000] -> logits: float32[1, 2]`，即一秒、16 kHz、batch=1；不支持动态 batch 或动态时长。
 
 ## 导出 v6.1 hi_xiaowen
 
-在项目根目录下执行。以下 checkpoint/spec 是当前 v6.1 `hi_xiaowen` 的 `c11_stage_margin_scale_u16/seed_42` 配对产物，所有路径均相对于项目根目录：
+在 `upstream/repo` 下执行。以下 checkpoint/spec 是当前 v6.1 `hi_xiaowen` 的 `c11_stage_margin_scale_u16/seed_42` 配对产物，所有路径均相对于项目根目录：
 
 ```powershell
 python dscnn_kws/ONNX/export_v6_1_int8_qoperator.py --checkpoint dscnn_kws/quantization/bit_accurate_mfcc_experiments_v6_1_strict_scale_calibration/qat_runs/phase_a/c11_stage_margin_scale_u16/seed_42/mobvoi_hi_xiaowen_binary_hardneg_L5_C64_layers5_channels64_params22530_noise_best_bit_accurate_mfcc_int8_backbone.pt --spec dscnn_kws/quantization/bit_accurate_mfcc_experiments_v6_1_strict_scale_calibration/qat_runs/phase_a/c11_stage_margin_scale_u16/seed_42/mobvoi_hi_xiaowen_binary_hardneg_L5_C64_layers5_channels64_params22530_noise_best_bit_accurate_mfcc_spec.json --output artifacts/v6_1_hi_xiaowen_exact_int8.onnx --report artifacts/v6_1_hi_xiaowen_exact_int8.report.json
@@ -53,7 +53,7 @@ CLI 参数如下：
 动态库：
 
 ```powershell
-python dscnn_kws/ONNX/export_v6_1_int8_runtime_bundle.py `
+D:\VAD-KWS\.envs\vadbench-py311-cpu\python.exe dscnn_kws\ONNX\export_v6_1_int8_runtime_bundle.py `
   --checkpoint dscnn_kws\quantization\bit_accurate_mfcc_experiments_v6_1_strict_scale_calibration\qat_runs\phase_a\c11_stage_margin_scale_u16\seed_42\mobvoi_hi_xiaowen_binary_hardneg_L5_C64_layers5_channels64_params22530_noise_best_bit_accurate_mfcc_int8_backbone.pt `
   --spec dscnn_kws\quantization\bit_accurate_mfcc_experiments_v6_1_strict_scale_calibration\qat_runs\phase_a\c11_stage_margin_scale_u16\seed_42\mobvoi_hi_xiaowen_binary_hardneg_L5_C64_layers5_channels64_params22530_noise_best_bit_accurate_mfcc_spec.json `
   --output-dir artifacts `

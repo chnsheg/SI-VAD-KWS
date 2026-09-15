@@ -140,8 +140,6 @@ def build_backbone(
     sample_rate: int,
     window_stride_ms: int,
     dct_coeff: int,
-    pooling: str = "global",
-    temporal_bins: int = 4,
 ) -> DSCNN:
     time_steps = calculate_time_steps(sample_rate, window_stride_ms)
     input_dim = time_steps * dct_coeff
@@ -150,8 +148,6 @@ def build_backbone(
         label_count=label_count,
         model_size_info=make_model_size_info(num_layers, channels),
         dct_coeff=dct_coeff,
-        pooling=pooling,
-        temporal_bins=temporal_bins,
     )
 
 
@@ -302,8 +298,6 @@ def select_model_and_state(
         sample_rate=args.sample_rate,
         window_stride_ms=args.window_stride_ms,
         dct_coeff=args.dct_coeff,
-        pooling=getattr(args, "pooling", "global"),
-        temporal_bins=int(getattr(args, "temporal_bins", 4)),
     )
 
     if args.export_mode == "backbone":
@@ -469,8 +463,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window_stride_ms", type=int, default=DEFAULT_WINDOW_STRIDE_MS)
     parser.add_argument("--layers", type=int, default=None, help="Override inferred layer count")
     parser.add_argument("--channels", type=int, default=None, help="Override inferred channel count")
-    parser.add_argument("--pooling", choices=["global", "temporal"], default="global")
-    parser.add_argument("--temporal_bins", type=int, default=4)
 
     parser.add_argument("--frontend", choices=["mfcc", "bandpass"], default=DEFAULT_FRONTEND)
     parser.add_argument("--mfcc_impl", choices=["torchaudio", "torch"], default=DEFAULT_MFCC_IMPL)
