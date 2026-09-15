@@ -2,6 +2,12 @@
 
 这个目录是从 TorchKWS 中拆分出的 **仅 DSCNN** 训练工程。
 
+> **当前项目线提示**：本文档描述的是上游 GSC 基线与 PWL 实验用法。当前交付线
+> （reclean v2，v419）使用同一 trainer 的 packed-mixture 数据流（base pack + raw
+> anchors + 硬负 pack + 低 SNR 正例 pack），在服务端四卡训练，入口
+> `tools/run_kws_reclean_four_gpu.py`，数据管线见 `data/README.md`，部署导出见
+> `deploy_transfer/README.md`，整体链路与前端系谱见仓库根 `README.md`。
+
 ## 特性
 
 - 只保留 DSCNN 模型训练链路（无多模型分发接口）
