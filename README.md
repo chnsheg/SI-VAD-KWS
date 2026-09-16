@@ -68,20 +68,21 @@ class 0），不要回退到早期自写导出脚本。
   只能从零重训恢复；正例噪声混合 SNR ≥5 dB 会让语音域 FAH 爆炸（<-5 dB 混合是
   压误唤醒的承重成分）；TAU 硬负挖掘必须密集（≥0.3 全窗、每文件封顶 20）。
 
-## 服务端环境（训练与数据所在）
+## 训练服务器（训练与数据所在）
 
-训练/数据都在 `chensheng@ai.si-in.com`（本仓库不含数据）：
+训练与数据在内部 GPU 服务器上执行（本仓库不含数据；主机地址与账号走内部渠道交接，
+不写入仓库）。目录布局约定：
 
 ```text
-/home/chensheng/vad_kws_datasets/     数据集根（kws_reclean_aug_v1 等）
-/home/chensheng/kws_packs/            packed mixture / 硬负 / 低 SNR 正例 pack
-/home/chensheng/kws_training_runs/    训练 runs（kws_reclean_v2/v419_a_20260915 等）
-/home/chensheng/vad_kws_sources/reclean_v3/kws_trainer_20260910_v21bucket
-                                      训练器快照（已同步入本仓库 dscnn_kws/）
+vad_kws_datasets/                      数据集根（kws_reclean_aug_v1 等）
+kws_packs/                             packed mixture / 硬负 / 低 SNR 正例 pack
+kws_training_runs/                     训练 runs（kws_reclean_v2/v419_a_20260915 等）
+vad_kws_sources/reclean_v3/kws_trainer_20260910_v21bucket
+                                       训练器快照（已同步入本仓库 dscnn_kws/）
 ```
 
-数据一律放 home 盘，不放 `/dev/shm`（共享机器会被清理）；不要用 GPU0（他人进程
-占用）；Python 用 demucs 环境（含 torchaudio）。
+使用规则：数据一律放 home 盘，不放 `/dev/shm`（共享机器会被清理）；不要用 GPU0
+（他人进程占用）；Python 用 demucs 环境（含 torchaudio）。
 
 ## 环境与快速检查
 

@@ -33,8 +33,8 @@
   （标注中点 ±0.4 s 内存在过阈值窗口）。
 - `plot_slidewin_compare.py`：将比对 JSON 画成分数时间线对比图。
 
-注意：`slidewin_compare.py` 顶部写死了服务端路径（`/home/chensheng/...`）用于
-`sys.path` 注入，换环境时需按本仓库路径调整这两个常量；其余脚本为自包含实现，
+注意：`slidewin_compare.py` 顶部写死了训练服务器的绝对路径（REPO/DEPLOY 两个常量）
+用于 `sys.path` 注入，换环境时需按实际路径调整这两个常量；其余脚本为自包含实现，
 仅依赖 torch / onnx / numpy / matplotlib。
 
 ## 用法
